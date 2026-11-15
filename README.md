@@ -72,9 +72,10 @@ Add `--no-scan` to report from the latest stored snapshot without touching the d
 ## State
 
 Everything is under `~/.diskledger` (override with `DISKLEDGER_HOME`):
-`config`, `snapshots/*.tsv`, `checkpoints/*`. Snapshots are pruned to
-`keep_snapshots` (default 300); a snapshot that a checkpoint points at is
-kept. If a snapshot cannot be written, for example on a full disk, the
+`config`, `snapshots/*.tsv`, `checkpoints/*`. The newest `keep_snapshots`
+(default 100, about a day at 15-minute scans) are kept in full; older ones
+thin to one per day for 30 days. A snapshot that a checkpoint points at is
+always kept. If a snapshot cannot be written, for example on a full disk, the
 command still prints its result.
 
 ## Releases
@@ -82,5 +83,11 @@ command still prints its result.
 Releases are cut by running the `release` workflow by hand. It picks the next
 version from the existing tags (patch by default), builds the binary, and
 publishes it. Tick "prerelease" for a release candidate (`vX.Y.Z-rc.N`).
-The version in `Cargo.toml` is only used for the very first release; after
-that the tag is the version, and `diskledger --version` reports it.
+The workflow writes the chosen version into `Cargo.toml` and commits it before
+tagging, so `diskledger --version` always matches the tag.
+
+To install a specific release from source:
+
+```bash
+cargo install --git https://github.com/scottopell/diskledger --tag v0.1.0 --locked
+```

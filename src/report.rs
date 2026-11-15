@@ -31,10 +31,18 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
     let paths: BTreeSet<&str> = base.rows.keys().chain(cur.rows.keys()).map(|s| s.as_str()).collect();
     let delta = |p: &str| bytes_of(cur, p) as i64 - bytes_of(base, p) as i64;
     let free_delta = cur.free as i64 - base.free as i64;
+    let (kids, tops) = tree(&paths);
+    // A monitored directory added after the baseline was taken has no
+    // "before", so report it separately instead of as growth.
+    let unbaselined: Vec<&str> = tops.iter().copied().filter(|t| !base.rows.contains_key(*t)).collect();
+    let covered = |p: &str| {
+        !unbaselined.iter().any(|u| p == *u || (p.starts_with(u) && p.as_bytes().get(u.len()) == Some(&b'/')))
+    };
 
     if json {
-        let mut rows: Vec<&str> = paths.iter().copied().filter(|p| delta(p).unsigned_abs() >= min).collect();
+        let mut rows: Vec<&str> = paths.iter().copied().filter(|p| covered(p) && delta(p).unsigned_abs() >= min).collect();
         rows.sort_by_key(|p| std::cmp::Reverse(delta(p).unsigned_abs()));
+        let skipped: Vec<String> = unbaselined.iter().map(|u| json_str(u)).collect();
         let items: Vec<String> = rows
             .iter()
             .map(|p| {
@@ -48,13 +56,14 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
             })
             .collect();
         println!(
-            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"min_bytes\":{},\"changes\":[{}]}}",
+            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"changes\":[{}]}}",
             base.ts,
             cur.ts,
             base.free,
             cur.free,
             free_delta,
             min,
+            skipped.join(","),
             items.join(",")
         );
         return;
@@ -69,13 +78,15 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
         human_delta(free_delta)
     );
     println!("{:>9} {:>9}  PATH   (changes of at least {})", "CHANGE", "NOW", human(min));
-    let (kids, tops) = tree(&paths);
     let mut shown = 0;
-    for top in tops {
+    for top in tops.iter().copied().filter(|t| covered(t)) {
         shown += print_diff(top, 0, &kids, &delta, cur, base, min);
     }
     if shown == 0 {
         println!("  (nothing changed by {} or more)", human(min));
+    }
+    for u in &unbaselined {
+        println!("Not in the baseline, so no change shown: {} ({} now)", u, human(bytes_of(cur, u)));
     }
 }
 

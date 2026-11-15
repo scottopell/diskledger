@@ -188,7 +188,9 @@ impl Ctx<'_> {
             return false;
         }
         let mut n = 0;
-        for (p, r) in prev.subtree(key) {
+        let min = self.cfg.record_min_bytes;
+        // Drop rows that an older, finer-grained config recorded.
+        for (p, r) in prev.subtree(key).filter(|(p, r)| p.as_str() == key || r.pending || r.bytes >= min) {
             if r.pending {
                 self.rep.would_flag.push(p.clone());
             }

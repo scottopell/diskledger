@@ -7,6 +7,9 @@ name: release
 #   prerelease:  v0.1.1-rc.1, v0.1.1-rc.2, ... for the next stable version
 #
 # With no stable tag yet, the first version is the one in Cargo.toml.
+# The chosen version is written to Cargo.toml and committed to the branch
+# before tagging, so `cargo install --git ... --tag vX.Y.Z` and
+# `diskledger --version` agree with the tag.
 
 on:
   workflow_dispatch:
@@ -65,12 +68,27 @@ jobs:
           echo "tag=v$version" >>"$GITHUB_OUTPUT"
           echo "Releasing v$version (previous stable: ${latest:-none})"
 
+      - name: Set the version in Cargo.toml
+        id: bump
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sed -i '' "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          cargo update --workspace
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "Release $TAG"
+            git push origin "HEAD:$GITHUB_REF_NAME"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+
       - name: Test
         run: cargo test --release --locked
 
       - name: Build
-        env:
-          DISKLEDGER_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           rustup target add "$TARGET"
           cargo build --release --locked --target "$TARGET"
@@ -94,9 +112,10 @@ jobs:
           TAG: ${{ steps.ver.outputs.tag }}
           ASSET: ${{ steps.pkg.outputs.asset }}
           PRERELEASE: ${{ inputs.prerelease }}
+          SHA: ${{ steps.bump.outputs.sha }}
         run: |
           set -euo pipefail
           flags=()
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
           gh release create "$TAG" "$ASSET" "$ASSET.sha256" \
-            --target "$GITHUB_SHA" --title "$TAG" --generate-notes "${flags[@]}"
+            --target "$SHA" --title "$TAG" --generate-notes "${flags[@]}"

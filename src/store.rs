@@ -4,7 +4,7 @@
 //! `~/.diskledger`). Snapshots are small TSV files; a failed write (for
 //! example a full disk) never stops a command from printing its result.
 
-use crate::util::{tsv_esc, tsv_unesc, Res};
+use crate::util::{now, tsv_esc, tsv_unesc, Res};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -21,6 +21,7 @@ pub struct Config {
     pub max_depth: u32,
     /// Do not descend into directories with more child directories than this.
     pub max_children: usize,
+    /// Recent snapshots kept in full. Older ones thin to one per day for 30 days.
     pub keep_snapshots: usize,
 }
 
@@ -29,10 +30,10 @@ impl Default for Config {
         Config {
             roots: Vec::new(),
             flag_min_entries: 20_000,
-            record_min_bytes: 16 << 20,
+            record_min_bytes: 64 << 20,
             max_depth: 12,
             max_children: 2_000,
-            keep_snapshots: 300,
+            keep_snapshots: 100,
         }
     }
 }
@@ -226,15 +227,19 @@ impl Store {
         v
     }
 
-    /// Delete the oldest snapshots beyond `keep`, never one a checkpoint points at.
+    /// Keep the newest `keep` snapshots. Of the older ones keep the last of
+    /// each UTC day for 30 days. Never delete one a checkpoint points at.
     pub fn prune(&self, keep: usize) {
         let all = self.list();
         if all.len() <= keep {
             return;
         }
         let pinned: Vec<u64> = self.checkpoints().into_iter().map(|(_, ts)| ts).collect();
-        for ts in &all[..all.len() - keep] {
-            if !pinned.contains(ts) {
+        let cutoff = now().saturating_sub(30 * 86400);
+        let mut days_kept = std::collections::HashSet::new();
+        for ts in all[..all.len() - keep].iter().rev() {
+            let daily = *ts >= cutoff && days_kept.insert(*ts / 86400);
+            if !daily && !pinned.contains(ts) {
                 let _ = fs::remove_file(self.snap_path(*ts));
             }
         }

@@ -93,8 +93,7 @@ fn run(mut raw: Vec<String>) -> Res<()> {
         return Ok(());
     }
     if raw[0] == "--version" || raw[0] == "-V" || raw[0] == "version" {
-        // Release builds set DISKLEDGER_VERSION from the git tag.
-        println!("diskledger {}", option_env!("DISKLEDGER_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")));
+        println!("diskledger {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let cmd = raw.remove(0);
