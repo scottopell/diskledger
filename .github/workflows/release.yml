@@ -49,6 +49,7 @@ jobs:
           latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -v -- '-rc\.' | sort -V | tail -n 1 || true)
           if [ -z "$latest" ]; then
             next=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+            next="${next%%-*}" # drop a release-candidate suffix left by an earlier rc
           else
             IFS=. read -r major minor patch <<<"${latest#v}"
             case "$BUMP" in
@@ -115,7 +116,8 @@ jobs:
           SHA: ${{ steps.bump.outputs.sha }}
         run: |
           set -euo pipefail
+          # The runner's bash 3.2 treats an empty array as unset under `set -u`.
           flags=()
           if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
           gh release create "$TAG" "$ASSET" "$ASSET.sha256" \
-            --target "$SHA" --title "$TAG" --generate-notes "${flags[@]}"
+            --target "$SHA" --title "$TAG" --generate-notes ${flags[@]+"${flags[@]}"}
