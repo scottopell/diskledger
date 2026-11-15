@@ -1,0 +1,102 @@
+name: release
+
+# Run manually. Picks the next version from the existing tags, builds the
+# binary, and publishes a GitHub release with it attached.
+#
+#   stable:      v0.1.0 -> v0.1.1 (or minor / major)
+#   prerelease:  v0.1.1-rc.1, v0.1.1-rc.2, ... for the next stable version
+#
+# With no stable tag yet, the first version is the one in Cargo.toml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Which part of the version to increase
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      prerelease:
+        description: Publish a release candidate instead of a stable release
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags are needed to work out the next version
+
+      - name: Work out the next version
+        id: ver
+        env:
+          BUMP: ${{ inputs.bump }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          latest=$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -v -- '-rc\.' | sort -V | tail -n 1 || true)
+          if [ -z "$latest" ]; then
+            next=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          else
+            IFS=. read -r major minor patch <<<"${latest#v}"
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              *) patch=$((patch + 1)) ;;
+            esac
+            next="$major.$minor.$patch"
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            n=$(git tag -l "v$next-rc.*" | wc -l | tr -d ' ')
+            version="$next-rc.$((n + 1))"
+          else
+            version="$next"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "tag=v$version" >>"$GITHUB_OUTPUT"
+          echo "Releasing v$version (previous stable: ${latest:-none})"
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Build
+        env:
+          DISKLEDGER_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          rustup target add "$TARGET"
+          cargo build --release --locked --target "$TARGET"
+
+      - name: Package
+        id: pkg
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          name="diskledger-$TAG-$TARGET"
+          mkdir "$name"
+          cp "target/$TARGET/release/diskledger" README.md "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" >"$name.tar.gz.sha256"
+          echo "asset=$name.tar.gz" >>"$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          ASSET: ${{ steps.pkg.outputs.asset }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=()
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          gh release create "$TAG" "$ASSET" "$ASSET.sha256" \
+            --target "$GITHUB_SHA" --title "$TAG" --generate-notes "${flags[@]}"
