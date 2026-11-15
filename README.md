@@ -93,3 +93,7 @@ To install a specific release from source:
 ```bash
 cargo install --git https://github.com/scottopell/diskledger --tag v0.1.0 --locked
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

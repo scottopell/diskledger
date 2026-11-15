@@ -2,6 +2,8 @@
 name = "diskledger"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/scottopell/diskledger"
 description = "Directory-size ledger for macOS/APFS: checkpoints, diffs, and kernel dir-stats flagging"
 
 [dependencies]
