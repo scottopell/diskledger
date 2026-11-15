@@ -34,6 +34,7 @@ diskledger diff                # what changed since the last checkin
 | `init <dir>...` | Write the config with these monitored directories | Config only |
 | `scan` | Record sizes; flag large directories | Flags directories |
 | `scan --dry-run` | Same, but only list what would be flagged | No |
+| `scan --full` | Re-examine every directory, ignoring the previous snapshot | Flags directories |
 | `diff [--since X]` | Changes since a checkpoint, an age (`2h`, `3d`) or a timestamp | Snapshot only |
 | `checkin` | Baseline for the next plain `diff` | Snapshot only |
 | `checkpoint <name>` | Named baseline | Snapshot only |
@@ -50,7 +51,8 @@ Add `--no-scan` to report from the latest stored snapshot without touching the d
 - Only `scan` flags. `diff`, `checkin`, `top` and `candidates` never do.
 - A monitored root is always flagged. Below it, a directory is flagged when
   the part of it not already covered by a flagged child holds at least
-  `flag_min_entries` entries (default 20,000).
+  `flag_min_entries` entries (default 5,000). After changing that setting,
+  run `diskledger scan --full` once so unchanged directories are re-examined.
 - Flagging runs bottom-up, so each file is walked once.
 - An unchanged flagged directory is skipped entirely on later scans, using
   the kernel's change counter.

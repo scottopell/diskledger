@@ -15,9 +15,12 @@ diskledger: what grew, what shrank, and what could be freed (macOS / APFS)
 
 USAGE
   diskledger init <dir>...          Create the config with these monitored directories
-  diskledger scan [--dry-run]       Record sizes and flag large directories for instant
+  diskledger scan [--dry-run] [--full]
+                                    Record sizes and flag large directories for instant
                                     kernel totals. This is what the periodic job runs.
                                     --dry-run lists what would be flagged and flags nothing.
+                                    --full re-examines every directory; use it after
+                                    changing flag_min_entries in the config.
   diskledger diff [--since X]       Show what changed. X is a checkpoint name, an age
                                     (90m, 2h, 3d) or a snapshot timestamp. Default: the
                                     'checkin' checkpoint, else the previous snapshot.
@@ -140,11 +143,13 @@ fn cmd_init(store: &Store, args: &Args) -> Res<()> {
 }
 
 /// Scan the disk, store the snapshot, and return it. A failed save is reported and ignored.
-fn fresh_scan(store: &Store, cfg: &Config, flag: bool, verbose: bool) -> Res<ScanReport> {
+fn fresh_scan(store: &Store, cfg: &Config, flag: bool, verbose: bool, full: bool) -> Res<ScanReport> {
     // Flagging scans are exclusive; read-only scans may overlap.
     let _lock = if flag { Some(store.lock()?) } else { None };
     let prev = store.latest();
-    let mut rep = scan::run(cfg, prev.as_ref(), &ScanOpts { flag, verbose });
+    // A full scan ignores the previous snapshot, so every directory is re-examined.
+    let reuse_from = if full { None } else { prev.as_ref() };
+    let mut rep = scan::run(cfg, reuse_from, &ScanOpts { flag, verbose });
     // Keep timestamps strictly increasing so every snapshot has its own file.
     if let Some(p) = &prev {
         if rep.snapshot.ts <= p.ts {
@@ -161,7 +166,7 @@ fn fresh_scan(store: &Store, cfg: &Config, flag: bool, verbose: bool) -> Res<Sca
 fn cmd_scan(store: &Store, args: &Args) -> Res<()> {
     let cfg = store.config()?;
     let dry = args.has("--dry-run");
-    let rep = fresh_scan(store, &cfg, !dry, args.has("--verbose"))?;
+    let rep = fresh_scan(store, &cfg, !dry, args.has("--verbose"), args.has("--full"))?;
     println!("{}", rep.summary());
     if dry {
         println!("Would flag {} directories:", rep.would_flag.len());
@@ -192,7 +197,7 @@ fn current(store: &Store, args: &Args) -> Res<Snapshot> {
         return store.latest().ok_or_else(|| "no snapshots yet. Run: diskledger scan".to_string());
     }
     let cfg = store.config()?;
-    let rep = fresh_scan(store, &cfg, false, false)?;
+    let rep = fresh_scan(store, &cfg, false, false, false)?;
     if !args.has("--json") {
         eprintln!("scan: {}", rep.summary());
     }

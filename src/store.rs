@@ -29,7 +29,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             roots: Vec::new(),
-            flag_min_entries: 20_000,
+            flag_min_entries: 5_000,
             record_min_bytes: 64 << 20,
             max_depth: 12,
             max_children: 2_000,
