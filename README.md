@@ -38,12 +38,22 @@ diskledger diff                # what changed since the last checkin
 | `diff [--since X]` | Changes since a checkpoint, an age (`2h`, `3d`) or a timestamp | Snapshot only |
 | `checkin` | Baseline for the next plain `diff` | Snapshot only |
 | `checkpoint <name>` | Named baseline | Snapshot only |
+| `size <path>...` | Size of any path right now; `-k` prints exactly what `du -sk` prints | No |
 | `top [dir]` | Largest directories | Snapshot only |
 | `candidates` | Directories named like build output, with how long unchanged | Snapshot only |
 | `status` | Free space, roots, snapshots, checkpoints | No |
 | `agent install` | Run `scan` every 15 minutes through launchd | Installs a LaunchAgent |
 
-Add `--json` to `diff`, `top`, `candidates` and `status` for agents.
+Add `--json` to `diff`, `size`, `top`, `candidates` and `status` for agents.
+
+`size` needs no config and works on any path, monitored or not. On a flagged
+directory it answers from the kernel record; elsewhere the kernel walks the
+subtree, which is still several times faster than `du`.
+
+`diff` ends with how much of the free-space change the monitored folders
+account for and how much happened elsewhere on the volume (`outside_delta`
+in JSON). A large "elsewhere" figure means something outside the monitored
+folders grew or shrank.
 Add `--no-scan` to report from the latest stored snapshot without touching the disk.
 
 ## How flagging works

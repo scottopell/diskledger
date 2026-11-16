@@ -26,6 +26,9 @@ USAGE
                                     'checkin' checkpoint, else the previous snapshot.
   diskledger checkin                Mark now as the baseline for the next plain 'diff'
   diskledger checkpoint <name>      Save a named baseline
+  diskledger size <path>...         Size of any path right now, like 'du -s'. Instant for
+                                    flagged directories; otherwise the kernel walks it.
+                                    -k prints 'KiB<TAB>path', the same as 'du -sk'.
   diskledger top [dir]              Largest directories in the latest snapshot
   diskledger candidates             Regenerable-looking directories (target, node_modules, ...)
   diskledger status                 Free space, roots, snapshots, checkpoints
@@ -59,6 +62,8 @@ impl Args {
                 a.flags.insert(x, v);
             } else if x == "-v" {
                 a.flags.insert("--verbose".into(), String::new());
+            } else if x == "-k" {
+                a.flags.insert("--kb".into(), String::new());
             } else if x.starts_with("--") {
                 a.flags.insert(x, String::new());
             } else {
@@ -111,6 +116,7 @@ fn run(mut raw: Vec<String>) -> Res<()> {
             let name = args.pos.first().ok_or("usage: diskledger checkpoint <name>")?.clone();
             cmd_checkpoint(&store, &args, &name)
         }
+        "size" => cmd_size(&args),
         "top" => cmd_top(&store, &args),
         "candidates" => cmd_candidates(&store, &args),
         "status" => cmd_status(&store, &args),
@@ -255,6 +261,13 @@ fn cmd_top(store: &Store, args: &Args) -> Res<()> {
         Some(p) => Some(store::canonical(&PathBuf::from(p))?.to_string_lossy().into_owned()),
         None => None,
     };
+    if let Some(u) = &under {
+        if !cur.rows.contains_key(u) {
+            return Err(format!(
+                "{u} is not in the snapshot (outside the monitored folders, or smaller than the recording minimum). Use: diskledger size {u}"
+            ));
+        }
+    }
     report::top(&cur, min, depth, under.as_deref(), args.has("--json"));
     Ok(())
 }
@@ -327,6 +340,63 @@ fn cmd_status(store: &Store, args: &Args) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Size of arbitrary paths, straight from the kernel. Needs no config and no snapshot.
+fn cmd_size(args: &Args) -> Res<()> {
+    if args.pos.is_empty() {
+        return Err("usage: diskledger size [-k] [--json] <path>...".into());
+    }
+    let (json, kb) = (args.has("--json"), args.has("--kb"));
+    let mut items = Vec::new();
+    let mut failed = false;
+    if !json && !kb {
+        println!("{:>9} {:>9}  PATH   (* = instant kernel record)", "SIZE", "ENTRIES");
+    }
+    for p in &args.pos {
+        let path = PathBuf::from(p);
+        let start = std::time::Instant::now();
+        // (bytes, entries, answered from a kernel record)
+        let res: Result<(u64, u64, bool), String> = match std::fs::symlink_metadata(&path) {
+            Err(e) => Err(e.to_string()),
+            Ok(m) if m.is_dir() => kstat::query(&path).map(|s| (s.bytes, s.entries, s.has_record)).map_err(|e| e.to_string()),
+            Ok(m) => {
+                use std::os::unix::fs::MetadataExt;
+                Ok((m.blocks() * 512, 0, false))
+            }
+        };
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        match res {
+            Ok((bytes, entries, instant)) => {
+                if json {
+                    items.push(format!(
+                        "{{\"path\":{},\"bytes\":{},\"entries\":{},\"instant\":{},\"ms\":{:.1}}}",
+                        json_str(p), bytes, entries, instant, ms
+                    ));
+                } else if kb {
+                    println!("{}\t{}", bytes.div_ceil(1024), p);
+                } else {
+                    println!("{:>9} {:>9}  {}{}", human(bytes), entries, p, if instant { " *" } else { "" });
+                }
+            }
+            Err(e) => {
+                failed = true;
+                if json {
+                    items.push(format!("{{\"path\":{},\"error\":{}}}", json_str(p), json_str(&e)));
+                } else {
+                    eprintln!("diskledger: {p}: {e}");
+                }
+            }
+        }
+    }
+    if json {
+        println!("[{}]", items.join(","));
+    }
+    if failed {
+        Err("some paths could not be measured".into())
+    } else {
+        Ok(())
+    }
 }
 
 const AGENT_LABEL: &str = "com.diskledger.scan";

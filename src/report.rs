@@ -38,6 +38,10 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
     let covered = |p: &str| {
         !unbaselined.iter().any(|u| p == *u || (p.starts_with(u) && p.as_bytes().get(u.len()) == Some(&b'/')))
     };
+    // How much of the free-space change the monitored folders account for.
+    // The rest happened somewhere this tool is not watching.
+    let monitored_delta: i64 = tops.iter().copied().filter(|t| covered(t)).map(|t| delta(t)).sum();
+    let outside_delta = -free_delta - monitored_delta;
 
     if json {
         let mut rows: Vec<&str> = paths.iter().copied().filter(|p| covered(p) && delta(p).unsigned_abs() >= min).collect();
@@ -56,12 +60,14 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
             })
             .collect();
         println!(
-            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"changes\":[{}]}}",
+            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"monitored_delta\":{},\"outside_delta\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"changes\":[{}]}}",
             base.ts,
             cur.ts,
             base.free,
             cur.free,
             free_delta,
+            monitored_delta,
+            outside_delta,
             min,
             skipped.join(","),
             items.join(",")
@@ -87,6 +93,14 @@ pub fn diff(base: &Snapshot, cur: &Snapshot, min: u64, json: bool) {
     }
     for u in &unbaselined {
         println!("Not in the baseline, so no change shown: {} ({} now)", u, human(bytes_of(cur, u)));
+    }
+    println!(
+        "Monitored folders changed by {}; everything else on the volume by {}.",
+        human_delta(monitored_delta),
+        human_delta(outside_delta)
+    );
+    if outside_delta.unsigned_abs() >= min.max(256 << 20) {
+        println!("  That is space used outside the monitored folders. Find it with 'diskledger size <path>' or add the folder as a root.");
     }
 }
 
