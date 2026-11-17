@@ -79,7 +79,11 @@ Add `--no-scan` to report from the latest stored snapshot without touching the d
   update. The struct layout in `src/kstat.rs` was read from `apfs.util` on
   macOS 26.5.
 - `candidates` matches by directory name. It does not check whether a
-  process is using the directory or who owns it.
+  process is using the directory or who owns it. A matched directory that
+  holds git repositories is listed under `mixed`, not as a candidate; its
+  repository-free direct children are offered instead. Repositories are
+  found among recorded directories and the matched directory's direct
+  children, so a small repository nested deeper can be missed.
 
 ## State
 

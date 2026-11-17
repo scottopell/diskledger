@@ -184,25 +184,60 @@ fn print_top(p: &str, indent: usize, kids: &BTreeMap<&str, Vec<&str>>, s: &Snaps
     }
 }
 
+/// Git repositories at or below `p`: recorded directories, plus `p`'s direct children, that
+/// hold a `.git` entry. Small repositories nested deeper than one level are not seen.
+fn nested_repos(cur: &Snapshot, p: &str) -> Vec<String> {
+    let is_repo = |d: &str| std::path::Path::new(d).join(".git").exists();
+    let sub = format!("{p}/");
+    let mut found: BTreeSet<String> = cur
+        .rows
+        .range::<str, _>((std::ops::Bound::Included(p), std::ops::Bound::Unbounded))
+        .map(|(k, _)| k.as_str())
+        .take_while(|k| k.starts_with(p))
+        .filter(|k| (*k == p || k.starts_with(&sub)) && is_repo(k))
+        .map(str::to_string)
+        .collect();
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            if let Some(c) = e.path().to_str() {
+                if e.file_type().map_or(false, |t| t.is_dir()) && is_repo(c) {
+                    found.insert(c.to_string());
+                }
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 /// Regenerable-looking directories, largest first, with how long each has been unchanged.
+///
+/// A directory with a build-output name that holds git repositories is reported as `mixed`
+/// instead of as a candidate; its repository-free direct children take its place.
 pub fn candidates(store: &Store, cur: &Snapshot, min: u64, json: bool) {
     let mut picks: Vec<&str> = Vec::new();
+    let mut mixed: Vec<(&str, Vec<String>)> = Vec::new();
+    // Name-matched directories that hold repositories; their direct children get considered.
+    let mut opened: BTreeSet<&str> = BTreeSet::new();
+    // Rows iterate parents before children, so `picks` already holds any picked ancestor.
     for (p, r) in &cur.rows {
-        if r.bytes < min || !REGENERABLE.contains(&base_name(p)) {
+        let p = p.as_str();
+        if r.bytes < min {
             continue;
         }
-        // Skip a candidate nested inside another candidate.
-        let mut anc = parent_of(p);
-        let mut nested = false;
-        while let Some(a) = anc {
-            if cur.rows.contains_key(a) && REGENERABLE.contains(&base_name(a)) {
-                nested = true;
-                break;
-            }
-            anc = parent_of(a);
+        let named = REGENERABLE.contains(&base_name(p));
+        let promoted = parent_of(p).map_or(false, |a| opened.contains(a));
+        if !named && !promoted {
+            continue;
         }
-        if !nested {
+        if picks.iter().any(|a| p.starts_with(a) && p.as_bytes().get(a.len()) == Some(&b'/')) {
+            continue;
+        }
+        let repos = nested_repos(cur, p);
+        if repos.is_empty() {
             picks.push(p);
+        } else if named {
+            opened.insert(p);
+            mixed.push((p, repos));
         }
     }
     picks.sort_by_key(|p| std::cmp::Reverse(bytes_of(cur, p)));
@@ -243,7 +278,27 @@ pub fn candidates(store: &Store, cur: &Snapshot, min: u64, json: bool) {
                 )
             })
             .collect();
-        println!("{{\"ts\":{},\"history_starts\":{},\"total_bytes\":{},\"candidates\":[{}]}}", cur.ts, oldest, total, items.join(","));
+        let mixed_items: Vec<String> = mixed
+            .iter()
+            .map(|(p, repos)| {
+                let sample: Vec<String> = repos.iter().take(5).map(|r| json_str(r)).collect();
+                format!(
+                    "{{\"path\":{},\"bytes\":{},\"nested_repo_count\":{},\"nested_repos\":[{}]}}",
+                    json_str(p),
+                    bytes_of(cur, p),
+                    repos.len(),
+                    sample.join(",")
+                )
+            })
+            .collect();
+        println!(
+            "{{\"ts\":{},\"history_starts\":{},\"total_bytes\":{},\"candidates\":[{}],\"mixed\":[{}]}}",
+            cur.ts,
+            oldest,
+            total,
+            items.join(","),
+            mixed_items.join(",")
+        );
         return;
     }
     println!(
@@ -256,6 +311,12 @@ pub fn candidates(store: &Store, cur: &Snapshot, min: u64, json: bool) {
     println!("{:>9} {:>10}  PATH", "SIZE", "UNCHANGED");
     for p in &picks {
         println!("{:>9} {:>10}  {}", human(bytes_of(cur, p)), fmt_age(cur.ts.saturating_sub(unchanged_since[p])), p);
+    }
+    if !mixed.is_empty() {
+        println!("Not candidates: named like build output but holding git repositories.");
+        for (p, repos) in &mixed {
+            println!("{:>9} {:>10}  {}", human(bytes_of(cur, p)), format!("{} repos", repos.len()), p);
+        }
     }
     println!("Matched by directory name only. Not checked: whether a process is using it, or who owns it.");
 }
