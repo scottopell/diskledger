@@ -515,11 +515,11 @@ impl<'a> SharedCtx<'a> {
                     // Phase 1: probe Tier 0 (previously-flagged) children in microseconds.
                     // Unchanged ones reuse immediately; dirty ones still report their exact
                     // APFS totals right away, tightening the budget before any unflagged walk.
-                    let mut phase_b: Vec<ChildTask> = Vec::new();
-                    let mut rest_start = 0usize;
-                    while rest_start < children.len() && children[rest_start].2 == 0 {
-                        let (ref child, ref child_key, _, _) = children[rest_start];
-                        rest_start += 1;
+                    let mut tier01_tasks: Vec<ChildTask> = Vec::new();
+                    let mut idx = 0usize;
+                    while idx < children.len() && children[idx].2 == 0 {
+                        let (ref child, ref child_key, _, _) = children[idx];
+                        idx += 1;
                         if !self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false) {
                             continue;
                         }
@@ -543,15 +543,15 @@ impl<'a> SharedCtx<'a> {
                                         }
                                         continue;
                                     }
-                                    phase_b.push(ChildTask {
+                                    tier01_tasks.push(ChildTask {
                                         path: child.clone(),
                                         key: child_key.clone(),
                                         prefetched: Some(cst),
                                         already_accounted: true,
                                     });
                                 } else {
-                                    // Previously flagged dir was recreated unflagged; visit in Phase 2.
-                                    phase_b.push(ChildTask {
+                                    // Previously flagged dir was recreated unflagged; visit in Phase 2a.
+                                    tier01_tasks.push(ChildTask {
                                         path: child.clone(),
                                         key: child_key.clone(),
                                         prefetched: Some(cst),
@@ -565,13 +565,14 @@ impl<'a> SharedCtx<'a> {
                         }
                     }
 
+                    let mut tier2_tasks: Vec<ChildTask> = Vec::new();
                     let pruned_after_tier0 =
                         budget.can_prune(&st, depth, parent_needs_covered, self.cfg);
 
                     if pruned_after_tier0 {
                         // All remaining Tier 1/2 children are pruned; still check direct `.git` if regen.
                         if is_regen {
-                            for (child, child_key, _, _) in &children[rest_start..] {
+                            for (child, child_key, _, _) in &children[idx..] {
                                 if self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false)
                                     && self.sys.has_git(child)
                                 {
@@ -580,100 +581,65 @@ impl<'a> SharedCtx<'a> {
                             }
                         }
                     } else {
-                        for (child, child_key, _, _) in children.into_iter().skip(rest_start) {
-                            phase_b.push(ChildTask {
+                        for (child, child_key, tier, _) in children.into_iter().skip(idx) {
+                            let task = ChildTask {
                                 path: child,
                                 key: child_key,
                                 prefetched: None,
                                 already_accounted: false,
-                            });
+                            };
+                            if tier == 1 {
+                                tier01_tasks.push(task);
+                            } else {
+                                tier2_tasks.push(task);
+                            }
                         }
                     }
 
-                    // Phase 2: visit dirty Tier 0 + unpruned Tier 1/2 children.
-                    if let Some(pool) = pool.filter(|_| phase_b.len() >= 2) {
-                        let n_tasks = phase_b.len().min(pool.workers);
-                        let visited: Vec<AtomicBool> =
-                            (0..phase_b.len()).map(|_| AtomicBool::new(false)).collect();
-                        let batch = Arc::new(ChildBatch {
-                            tasks: phase_b,
-                            visited,
-                            next_idx: AtomicUsize::new(0),
-                            remaining_workers: AtomicUsize::new(n_tasks),
-                            pruned: AtomicBool::new(false),
-                            parent_st: st,
-                            parent_depth: depth,
+                    // Phase 2a: visit dirty Tier 0 + Tier 1 (previously large) before Tier 2 so
+                    // worker threads do not race into unrecorded small siblings before large ones
+                    // tighten the remaining byte/entry budget.
+                    if !tier01_tasks.is_empty() {
+                        budget = self.run_child_tasks(
+                            tier01_tasks,
+                            budget,
+                            st,
+                            depth,
                             dev,
                             parent_needs_covered,
                             child_needs_covered,
                             is_regen,
-                            budget: Mutex::new(budget),
-                        });
-                        pool.push_many((0..n_tasks).map(|_| Job::Children(Arc::clone(&batch))));
-                        pool.wait_for(self, &batch.remaining_workers);
+                            pool,
+                        );
+                    }
 
-                        if is_regen {
-                            for (i, task) in batch.tasks.iter().enumerate() {
-                                if !batch.visited[i].load(Ordering::Relaxed)
-                                    && self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false)
-                                {
-                                    let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                                    if !has_row && self.sys.has_git(&task.path) {
+                    // Phase 2b: visit Tier 2 (previously small/unrecorded) only if budget remains.
+                    if !tier2_tasks.is_empty() {
+                        if budget.can_prune(&st, depth, parent_needs_covered, self.cfg) {
+                            if is_regen {
+                                for task in &tier2_tasks {
+                                    if self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false)
+                                        && self.sys.has_git(&task.path)
+                                    {
                                         self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                                     }
                                 }
                             }
-                        }
-                        covered = batch.budget.lock().unwrap().covered;
-                    } else {
-                        let mut pruned_from = None;
-                        for (idx, task) in phase_b.iter().enumerate() {
-                            if !task.already_accounted
-                                && budget.can_prune(&st, depth, parent_needs_covered, self.cfg)
-                            {
-                                pruned_from = Some(idx);
-                                break;
-                            }
-                            let same_dev = task.prefetched.is_some()
-                                || self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false);
-                            if !same_dev {
-                                continue;
-                            }
-                            let res = self.visit(
-                                &task.path,
-                                depth + 1,
+                        } else {
+                            budget = self.run_child_tasks(
+                                tier2_tasks,
+                                budget,
+                                st,
+                                depth,
                                 dev,
+                                parent_needs_covered,
                                 child_needs_covered,
-                                task.prefetched,
+                                is_regen,
                                 pool,
                             );
-                            if !task.already_accounted {
-                                budget.covered += res.covered;
-                                budget.visited_bytes = budget.visited_bytes.saturating_add(res.bytes);
-                                budget.visited_entries =
-                                    budget.visited_entries.saturating_add(res.entries_plus_self);
-                            }
-                            if is_regen {
-                                let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                                if !has_row && self.sys.has_git(&task.path) {
-                                    self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
-                                }
-                            }
                         }
-                        if is_regen {
-                            if let Some(start) = pruned_from {
-                                for task in &phase_b[start..] {
-                                    if self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false) {
-                                        let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                                        if !has_row && self.sys.has_git(&task.path) {
-                                            self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        covered = budget.covered;
                     }
+                    covered = budget.covered;
                 }
                 Err(e) => {
                     self.out.lock().unwrap().errors.push(format!("{key}: {e}"));
@@ -728,6 +694,110 @@ impl<'a> SharedCtx<'a> {
             covered: out_covered,
             bytes: st.bytes,
             entries_plus_self: st.entries + 1,
+        }
+    }
+
+    /// If the kernel's change counter says nothing beneath `key` changed since
+    /// the previous snapshot, copy that snapshot's rows and skip the subtree.
+    fn run_child_tasks(
+        &self,
+        tasks: Vec<ChildTask>,
+        mut budget: Budget,
+        st: DirStat,
+        depth: u32,
+        dev: u64,
+        parent_needs_covered: bool,
+        child_needs_covered: bool,
+        is_regen: bool,
+        pool: Option<&Pool<'a>>,
+    ) -> Budget {
+        if let Some(pool) = pool.filter(|_| tasks.len() >= 2) {
+            let n_tasks = tasks.len().min(pool.workers);
+            let visited: Vec<AtomicBool> =
+                (0..tasks.len()).map(|_| AtomicBool::new(false)).collect();
+            let batch = Arc::new(ChildBatch {
+                tasks,
+                visited,
+                next_idx: AtomicUsize::new(0),
+                remaining_workers: AtomicUsize::new(n_tasks),
+                pruned: AtomicBool::new(false),
+                parent_st: st,
+                parent_depth: depth,
+                dev,
+                parent_needs_covered,
+                child_needs_covered,
+                is_regen,
+                budget: Mutex::new(budget),
+            });
+            pool.push_many((0..n_tasks).map(|_| Job::Children(Arc::clone(&batch))));
+            pool.wait_for(self, &batch.remaining_workers);
+
+            if is_regen {
+                for (i, task) in batch.tasks.iter().enumerate() {
+                    if !batch.visited[i].load(Ordering::Relaxed)
+                        && self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false)
+                    {
+                        let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
+                        if !has_row && self.sys.has_git(&task.path) {
+                            self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
+                        }
+                    }
+                }
+            }
+            let b = batch.budget.lock().unwrap();
+            Budget {
+                covered: b.covered,
+                visited_bytes: b.visited_bytes,
+                visited_entries: b.visited_entries,
+            }
+        } else {
+            let mut pruned_from = None;
+            for (idx, task) in tasks.iter().enumerate() {
+                if !task.already_accounted
+                    && budget.can_prune(&st, depth, parent_needs_covered, self.cfg)
+                {
+                    pruned_from = Some(idx);
+                    break;
+                }
+                let same_dev = task.prefetched.is_some()
+                    || self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false);
+                if !same_dev {
+                    continue;
+                }
+                let res = self.visit(
+                    &task.path,
+                    depth + 1,
+                    dev,
+                    child_needs_covered,
+                    task.prefetched,
+                    pool,
+                );
+                if !task.already_accounted {
+                    budget.covered += res.covered;
+                    budget.visited_bytes = budget.visited_bytes.saturating_add(res.bytes);
+                    budget.visited_entries =
+                        budget.visited_entries.saturating_add(res.entries_plus_self);
+                }
+                if is_regen {
+                    let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
+                    if !has_row && self.sys.has_git(&task.path) {
+                        self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
+                    }
+                }
+            }
+            if is_regen {
+                if let Some(start) = pruned_from {
+                    for task in &tasks[start..] {
+                        if self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false) {
+                            let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
+                            if !has_row && self.sys.has_git(&task.path) {
+                                self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            budget
         }
     }
 
