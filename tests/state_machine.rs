@@ -10,12 +10,12 @@ use diskledger::store::{Config, Snapshot, Store};
 use diskledger::sys::{DirListing, System};
 use diskledger::util::{is_same_or_under, is_under, normalize_path_str, parent_of};
 use proptest::prelude::*;
-use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 struct TempHome(PathBuf);
 
@@ -64,17 +64,22 @@ struct FakeDir {
     unreadable: bool,
 }
 
+#[derive(Debug, Default)]
+struct FakeState {
+    dirs: BTreeMap<String, FakeDir>,
+    files: BTreeMap<String, u64>,
+    symlinks: BTreeMap<String, String>,
+}
+
 /// Deterministic in-memory APFS simulator modeling monotonic dir-stats flags,
 /// recursive generation counters, symlinks, cross-device mounts, unreadable dirs,
 /// outside-volume free-space shifts, and a virtual Unix clock.
 struct FakeFs {
-    dirs: RefCell<BTreeMap<String, FakeDir>>,
-    files: RefCell<BTreeMap<String, u64>>,
-    symlinks: RefCell<BTreeMap<String, String>>,
-    outside_used: Cell<u64>,
+    state: Mutex<FakeState>,
+    outside_used: AtomicU64,
     volume_total: u64,
-    clock: Cell<u64>,
-    ops: RefCell<OpCounts>,
+    clock: AtomicU64,
+    ops: Mutex<OpCounts>,
 }
 
 impl FakeFs {
@@ -82,30 +87,32 @@ impl FakeFs {
         let mut dirs = BTreeMap::new();
         dirs.insert("/".into(), FakeDir { dev: 1, flagged: false, gen: 0, unreadable: false });
         FakeFs {
-            dirs: RefCell::new(dirs),
-            files: RefCell::new(BTreeMap::new()),
-            symlinks: RefCell::new(BTreeMap::new()),
-            outside_used: Cell::new(10 << 30),
+            state: Mutex::new(FakeState {
+                dirs,
+                files: BTreeMap::new(),
+                symlinks: BTreeMap::new(),
+            }),
+            outside_used: AtomicU64::new(10 << 30),
             volume_total: 200 << 30,
-            clock: Cell::new(start_ts),
-            ops: RefCell::new(OpCounts::default()),
+            clock: AtomicU64::new(start_ts),
+            ops: Mutex::new(OpCounts::default()),
         }
     }
 
     fn ops_total(&self) -> u64 {
-        self.ops.borrow().total()
+        self.ops.lock().unwrap().total()
     }
 
     fn ops_snapshot(&self) -> OpCounts {
-        self.ops.borrow().clone()
+        self.ops.lock().unwrap().clone()
     }
 
     fn advance_time(&self, dt: u64) {
-        self.clock.set(self.clock.get().saturating_add(dt));
+        let cur = self.clock.load(Ordering::Relaxed);
+        self.clock.store(cur.saturating_add(dt), Ordering::Relaxed);
     }
 
-    fn bump_ancestors(&self, path: &str, dev: u64) {
-        let mut dirs = self.dirs.borrow_mut();
+    fn bump_ancestors_locked(dirs: &mut BTreeMap<String, FakeDir>, path: &str, dev: u64) {
         let mut cur = parent_of(path);
         while let Some(anc) = cur {
             if let Some(d) = dirs.get_mut(anc) {
@@ -122,18 +129,19 @@ impl FakeFs {
 
     fn mkdir(&self, path: &str, dev: u64) {
         let p = normalize_path_str(path);
-        if self.dirs.borrow().contains_key(&p) {
+        let mut st = self.state.lock().unwrap();
+        if st.dirs.contains_key(&p) {
             return;
         }
-        self.dirs.borrow_mut().insert(
+        st.dirs.insert(
             p.clone(),
             FakeDir { dev, flagged: false, gen: 0, unreadable: false },
         );
-        self.bump_ancestors(&p, dev);
+        Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn set_unreadable(&self, path: &str, unreadable: bool) {
-        if let Some(d) = self.dirs.borrow_mut().get_mut(path) {
+        if let Some(d) = self.state.lock().unwrap().dirs.get_mut(path) {
             d.unreadable = unreadable;
         }
     }
@@ -141,21 +149,22 @@ impl FakeFs {
     fn write_file(&self, path: &str, bytes: u64) {
         let p = normalize_path_str(path);
         let Some(par) = parent_of(&p) else { return };
-        let Some(dev) = self.dirs.borrow().get(par).map(|d| d.dev) else { return };
-        if self.dirs.borrow().contains_key(&p) || self.symlinks.borrow().contains_key(&p) {
+        let mut st = self.state.lock().unwrap();
+        let Some(dev) = st.dirs.get(par).map(|d| d.dev) else { return };
+        if st.dirs.contains_key(&p) || st.symlinks.contains_key(&p) {
             return;
         }
-        self.files.borrow_mut().insert(p.clone(), bytes);
-        self.bump_ancestors(&p, dev);
+        st.files.insert(p.clone(), bytes);
+        Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn delete_file(&self, path: &str) {
         let p = normalize_path_str(path);
-        if self.files.borrow_mut().remove(&p).is_some() {
+        let mut st = self.state.lock().unwrap();
+        if st.files.remove(&p).is_some() {
             if let Some(par) = parent_of(&p) {
-                let dev = self.dirs.borrow().get(par).map(|d| d.dev);
-                if let Some(dev) = dev {
-                    self.bump_ancestors(&p, dev);
+                if let Some(dev) = st.dirs.get(par).map(|d| d.dev) {
+                    Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
                 }
             }
         }
@@ -163,54 +172,54 @@ impl FakeFs {
 
     fn delete_dir_tree(&self, path: &str) {
         let p = normalize_path_str(path);
-        let Some(dev) = self.dirs.borrow().get(&p).map(|d| d.dev) else { return };
-        self.dirs.borrow_mut().retain(|k, _| !is_same_or_under(k, &p));
-        self.files.borrow_mut().retain(|k, _| !is_under(k, &p));
-        self.symlinks.borrow_mut().retain(|k, _| !is_under(k, &p));
-        self.bump_ancestors(&p, dev);
+        let mut st = self.state.lock().unwrap();
+        let Some(dev) = st.dirs.get(&p).map(|d| d.dev) else { return };
+        st.dirs.retain(|k, _| !is_same_or_under(k, &p));
+        st.files.retain(|k, _| !is_under(k, &p));
+        st.symlinks.retain(|k, _| !is_under(k, &p));
+        Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn add_symlink(&self, path: &str, target: &str) {
         let p = normalize_path_str(path);
         let Some(par) = parent_of(&p) else { return };
-        let Some(dev) = self.dirs.borrow().get(par).map(|d| d.dev) else { return };
-        if self.dirs.borrow().contains_key(&p) || self.files.borrow().contains_key(&p) {
+        let mut st = self.state.lock().unwrap();
+        let Some(dev) = st.dirs.get(par).map(|d| d.dev) else { return };
+        if st.dirs.contains_key(&p) || st.files.contains_key(&p) {
             return;
         }
-        self.symlinks.borrow_mut().insert(p.clone(), target.to_string());
-        self.bump_ancestors(&p, dev);
+        st.symlinks.insert(p.clone(), target.to_string());
+        Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn adjust_outside(&self, delta: i64) {
-        let cur = self.outside_used.get();
+        let cur = self.outside_used.load(Ordering::Relaxed);
         let next = if delta >= 0 {
             cur.saturating_add(delta as u64).min(50 << 30)
         } else {
             cur.saturating_sub(delta.unsigned_abs())
         };
-        self.outside_used.set(next);
+        self.outside_used.store(next, Ordering::Relaxed);
     }
 
     /// Ground-truth same-volume stats for `path`, matching APFS semantics.
     fn ground_truth_stats(&self, path: &str) -> Option<DirStat> {
         let p = normalize_path_str(path);
-        let dirs = self.dirs.borrow();
-        let root_dir = dirs.get(&p)?;
+        let st = self.state.lock().unwrap();
+        let root_dir = st.dirs.get(&p)?;
         let dev = root_dir.dev;
 
-        // Collect all same-dev directories at or under `p` without crossing foreign mounts.
         let mut reachable = BTreeSet::new();
         reachable.insert(p.clone());
-        for (dpath, dinfo) in dirs.iter() {
+        for (dpath, dinfo) in st.dirs.iter() {
             if is_under(dpath, &p) && dinfo.dev == dev {
-                // Only reachable if every intermediate ancestor up to `p` is also same-dev.
                 let mut ok = true;
                 let mut anc = parent_of(dpath);
                 while let Some(a) = anc {
                     if a == p {
                         break;
                     }
-                    if dirs.get(a).map_or(true, |info| info.dev != dev) {
+                    if st.dirs.get(a).map_or(true, |info| info.dev != dev) {
                         ok = false;
                         break;
                     }
@@ -222,9 +231,9 @@ impl FakeFs {
             }
         }
 
-        let mut entries: u64 = (reachable.len() - 1) as u64; // subdirs strictly under `p`
+        let mut entries: u64 = (reachable.len() - 1) as u64;
         let mut bytes: u64 = 0;
-        for (fpath, fbytes) in self.files.borrow().iter() {
+        for (fpath, fbytes) in st.files.iter() {
             if let Some(par) = parent_of(fpath) {
                 if reachable.contains(par) {
                     entries += 1;
@@ -232,7 +241,7 @@ impl FakeFs {
                 }
             }
         }
-        for spath in self.symlinks.borrow().keys() {
+        for spath in st.symlinks.keys() {
             if let Some(par) = parent_of(spath) {
                 if reachable.contains(par) {
                     entries += 1;
@@ -252,8 +261,10 @@ impl FakeFs {
     }
 
     fn all_flagged(&self) -> BTreeSet<String> {
-        self.dirs
-            .borrow()
+        self.state
+            .lock()
+            .unwrap()
+            .dirs
             .iter()
             .filter(|(_, d)| d.flagged)
             .map(|(k, _)| k.clone())
@@ -262,19 +273,19 @@ impl FakeFs {
 
     fn dir_has_direct_git(&self, dir: &str) -> bool {
         let git_path = if dir == "/" { "/.git".to_string() } else { format!("{dir}/.git") };
-        self.files.borrow().contains_key(&git_path) || self.dirs.borrow().contains_key(&git_path)
+        let st = self.state.lock().unwrap();
+        st.files.contains_key(&git_path) || st.dirs.contains_key(&git_path)
     }
 
     fn vol1_used(&self) -> u64 {
-        let dirs = self.dirs.borrow();
-        let file_sum: u64 = self
+        let st = self.state.lock().unwrap();
+        let file_sum: u64 = st
             .files
-            .borrow()
             .iter()
-            .filter(|(p, _)| parent_of(p).and_then(|par| dirs.get(par)).map_or(false, |d| d.dev == 1))
+            .filter(|(p, _)| parent_of(p).and_then(|par| st.dirs.get(par)).map_or(false, |d| d.dev == 1))
             .map(|(_, b)| *b)
             .sum();
-        file_sum.saturating_add(self.outside_used.get())
+        file_sum.saturating_add(self.outside_used.load(Ordering::Relaxed))
     }
 }
 
@@ -284,7 +295,7 @@ impl System for FakeFs {
         let st = self
             .ground_truth_stats(&p)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such directory"))?;
-        let mut ops = self.ops.borrow_mut();
+        let mut ops = self.ops.lock().unwrap();
         ops.queries += 1;
         if !st.has_record {
             ops.walks += 1;
@@ -295,9 +306,10 @@ impl System for FakeFs {
 
     fn flag(&self, path: &Path) -> io::Result<()> {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().flags += 1;
-        let mut dirs = self.dirs.borrow_mut();
-        let d = dirs
+        self.ops.lock().unwrap().flags += 1;
+        let mut st = self.state.lock().unwrap();
+        let d = st
+            .dirs
             .get_mut(&p)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such directory"))?;
         d.flagged = true;
@@ -309,10 +321,12 @@ impl System for FakeFs {
 
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)> {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().volume_space += 1;
+        self.ops.lock().unwrap().volume_space += 1;
         let dev = self
+            .state
+            .lock()
+            .unwrap()
             .dirs
-            .borrow()
             .get(&p)
             .map(|d| d.dev)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))?;
@@ -320,17 +334,17 @@ impl System for FakeFs {
             let used = self.vol1_used();
             Ok((self.volume_total.saturating_sub(used), self.volume_total))
         } else {
-            // Separate volume with its own independent capacity.
             Ok((50 << 30, 100 << 30))
         }
     }
 
     fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().dev_checks += 1;
-        if let Some(d) = self.dirs.borrow().get(&p) {
+        self.ops.lock().unwrap().dev_checks += 1;
+        let st = self.state.lock().unwrap();
+        if let Some(d) = st.dirs.get(&p) {
             Ok(Some(d.dev))
-        } else if self.files.borrow().contains_key(&p) {
+        } else if st.files.contains_key(&p) {
             Ok(None)
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "not found"))
@@ -339,12 +353,12 @@ impl System for FakeFs {
 
     fn symlink_dev(&self, path: &Path) -> io::Result<u64> {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().dev_checks += 1;
-        if let Some(d) = self.dirs.borrow().get(&p) {
+        self.ops.lock().unwrap().dev_checks += 1;
+        let st = self.state.lock().unwrap();
+        if let Some(d) = st.dirs.get(&p) {
             Ok(d.dev)
         } else if let Some(par) = parent_of(&p) {
-            self.dirs
-                .borrow()
+            st.dirs
                 .get(par)
                 .map(|d| d.dev)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
@@ -355,17 +369,19 @@ impl System for FakeFs {
 
     fn list_dir(&self, path: &Path, max_children: usize) -> io::Result<DirListing> {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().list_dirs += 1;
-        let dirs = self.dirs.borrow();
-        let d = dirs
+        self.ops.lock().unwrap().list_dirs += 1;
+        let st = self.state.lock().unwrap();
+        let d = st
+            .dirs
             .get(&p)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such directory"))?;
         if d.unreadable {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"));
         }
-        let has_git = self.dir_has_direct_git(&p);
+        let git_path = if p == "/" { "/.git".to_string() } else { format!("{p}/.git") };
+        let has_git = st.files.contains_key(&git_path) || st.dirs.contains_key(&git_path);
         let mut subdirs = Vec::new();
-        for k in dirs.keys() {
+        for k in st.dirs.keys() {
             if parent_of(k) == Some(p.as_str()) {
                 subdirs.push(PathBuf::from(k));
                 if subdirs.len() > max_children {
@@ -378,12 +394,12 @@ impl System for FakeFs {
 
     fn has_git(&self, path: &Path) -> bool {
         let p = normalize_path_str(&path.to_string_lossy());
-        self.ops.borrow_mut().has_git += 1;
+        self.ops.lock().unwrap().has_git += 1;
         self.dir_has_direct_git(&p)
     }
 
     fn now(&self) -> u64 {
-        self.clock.get()
+        self.clock.load(Ordering::Relaxed)
     }
 }
 
@@ -561,8 +577,10 @@ proptest! {
             match tr {
                 Transition::WriteFile { dir_idx, name, bytes } => {
                     let candidates: Vec<String> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .iter()
                         .filter(|(k, d)| *k != "/" && *k != "/vol" && d.dev == 1)
                         .map(|(k, _)| k.clone())
@@ -575,7 +593,7 @@ proptest! {
                     }
                 }
                 Transition::DeleteFile { file_idx } => {
-                    let files: Vec<String> = fs.files.borrow().keys().cloned().collect();
+                    let files: Vec<String> = fs.state.lock().unwrap().files.keys().cloned().collect();
                     if !files.is_empty() {
                         fs.delete_file(&files[file_idx % files.len()]);
                         last_scan_was_clean_for_fs = false;
@@ -583,8 +601,10 @@ proptest! {
                 }
                 Transition::CreateDir { parent_idx, name } => {
                     let parents: Vec<String> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .iter()
                         .filter(|(k, d)| *k != "/" && *k != "/vol" && d.dev == 1)
                         .map(|(k, _)| k.clone())
@@ -592,7 +612,8 @@ proptest! {
                     if !parents.is_empty() {
                         let par = &parents[parent_idx % parents.len()];
                         let child = format!("{par}/{}", name.as_name());
-                        if !fs.files.borrow().contains_key(&child) {
+                        let is_file = fs.state.lock().unwrap().files.contains_key(&child);
+                        if !is_file {
                             fs.mkdir(&child, 1);
                             last_scan_was_clean_for_fs = false;
                         }
@@ -605,8 +626,10 @@ proptest! {
                         .map(|r| normalize_path_str(&r.to_string_lossy()))
                         .collect();
                     let removable: Vec<String> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .keys()
                         .filter(|k| *k != "/" && *k != "/vol" && !roots.contains(*k))
                         .cloned()
@@ -623,17 +646,21 @@ proptest! {
                     // ensuring real [gone] differs cleanly from config root removal.
                     if cfg.roots.len() >= 2 {
                         let r = normalize_path_str(&cfg.roots[root_idx % cfg.roots.len()].to_string_lossy());
-                        if fs.dirs.borrow().contains_key(&r) {
-                            // Keep at least one existing root on dev 1 so volume_space succeeds.
+                        let (exists, existing_vol1, is_vol1) = {
+                            let st = fs.state.lock().unwrap();
+                            let exists = st.dirs.contains_key(&r);
                             let existing_vol1 = cfg
                                 .roots
                                 .iter()
                                 .filter(|p| {
                                     let k = normalize_path_str(&p.to_string_lossy());
-                                    fs.dirs.borrow().get(&k).map_or(false, |d| d.dev == 1)
+                                    st.dirs.get(&k).map_or(false, |d| d.dev == 1)
                                 })
                                 .count();
-                            let is_vol1 = fs.dirs.borrow().get(&r).map_or(false, |d| d.dev == 1);
+                            let is_vol1 = st.dirs.get(&r).map_or(false, |d| d.dev == 1);
+                            (exists, existing_vol1, is_vol1)
+                        };
+                        if exists {
                             if !is_vol1 || existing_vol1 >= 2 {
                                 fs.delete_dir_tree(&r);
                                 prev_flagged.retain(|p| !is_same_or_under(p, &r));
@@ -652,8 +679,10 @@ proptest! {
                         .map(|r| normalize_path_str(&r.to_string_lossy()))
                         .collect();
                     let dirs: Vec<(String, bool)> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .iter()
                         .filter(|(k, _)| *k != "/" && *k != "/vol" && !roots.contains(*k))
                         .map(|(k, d)| (k.clone(), d.unreadable))
@@ -668,8 +697,10 @@ proptest! {
                 }
                 Transition::AddSymlinkCycle { parent_idx, target_idx } => {
                     let dirs: Vec<String> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .keys()
                         .filter(|k| *k != "/" && *k != "/vol")
                         .cloned()
@@ -683,8 +714,10 @@ proptest! {
                 }
                 Transition::AddCrossDevMount { parent_idx, bytes } => {
                     let dirs: Vec<String> = fs
+                        .state
+                        .lock()
+                        .unwrap()
                         .dirs
-                        .borrow()
                         .iter()
                         .filter(|(k, d)| *k != "/" && *k != "/vol" && d.dev == 1)
                         .map(|(k, _)| k.clone())
@@ -692,7 +725,11 @@ proptest! {
                     if !dirs.is_empty() {
                         let par = &dirs[parent_idx % dirs.len()];
                         let mnt = format!("{par}/ext_mount");
-                        if !fs.dirs.borrow().contains_key(&mnt) && !fs.files.borrow().contains_key(&mnt) {
+                        let occupied = {
+                            let st = fs.state.lock().unwrap();
+                            st.dirs.contains_key(&mnt) || st.files.contains_key(&mnt)
+                        };
+                        if !occupied {
                             fs.mkdir(&mnt, 2);
                             fs.write_file(&format!("{mnt}/huge.bin"), bytes);
                             last_scan_was_clean_for_fs = false;
@@ -752,9 +789,17 @@ proptest! {
                         None
                     };
 
-                    // Incremental == Full parity oracle for read-only scans when thresholds unchanged.
+                    // Incremental == Full parity oracle (also tests 1-thread vs parallel parity).
                     let full_oracle = if !flag && !full && !thresholds_dirty {
-                        Some(scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }))
+                        Some(scan::run_with_threads(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }, 1))
+                    } else {
+                        None
+                    };
+
+                    // Parallel vs single-threaded parity on every read-only scan.
+                    let seq_oracle = if !flag {
+                        let reuse = if full { None } else { prev_latest.as_ref() };
+                        Some(scan::run_with_threads(&fs, &cfg, reuse, &ScanOpts { flag: false, verbose: false }, 1))
                     } else {
                         None
                     };
@@ -769,13 +814,24 @@ proptest! {
                         prop_assert_eq!(ops_post_real.flags, ops_pre_real.flags);
                     }
 
+                    // Parallel scan must match single-threaded scan identically.
+                    if let Some(seq) = seq_oracle {
+                        prop_assert_eq!(&rep.snapshot.rows, &seq.snapshot.rows, "parallel vs 1-thread rows diverged");
+                        prop_assert_eq!(&rep.snapshot.extra_git_repos, &seq.snapshot.extra_git_repos);
+                        prop_assert_eq!(&rep.would_flag, &seq.would_flag, "parallel vs 1-thread would_flag diverged");
+                        prop_assert_eq!(&rep.errors, &seq.errors, "parallel vs 1-thread errors diverged");
+                    }
+
                     // Flagging is strictly monotonic for surviving directories (never unflagged).
                     let now_flagged = fs.all_flagged();
-                    let surviving_prev: BTreeSet<String> = prev_flagged
-                        .iter()
-                        .filter(|p| fs.dirs.borrow().contains_key(*p))
-                        .cloned()
-                        .collect();
+                    let surviving_prev: BTreeSet<String> = {
+                        let st = fs.state.lock().unwrap();
+                        prev_flagged
+                            .iter()
+                            .filter(|p| st.dirs.contains_key(*p))
+                            .cloned()
+                            .collect()
+                    };
                     prop_assert!(
                         surviving_prev.is_subset(&now_flagged),
                         "flags must never disappear from surviving directories"
@@ -1037,20 +1093,19 @@ proptest! {
                                     }
                                 })
                                 .unwrap_or(cfg.max_depth);
-                            let ci_unreadable = fs
-                                .dirs
-                                .borrow()
-                                .get(&ci.path)
-                                .map_or(true, |d| d.unreadable);
-                            let ci_bytes = cur.rows.get(&ci.path).map_or(0, |r| r.bytes);
-                            if !ci_unreadable && ci_depth < cfg.max_depth && ci_bytes >= cfg.record_min_bytes {
-                                let child_dirs: Vec<String> = fs
+                            let (ci_unreadable, child_dirs) = {
+                                let st = fs.state.lock().unwrap();
+                                let unr = st.dirs.get(&ci.path).map_or(true, |d| d.unreadable);
+                                let kids: Vec<String> = st
                                     .dirs
-                                    .borrow()
                                     .iter()
                                     .filter(|(k, d)| d.dev == 1 && parent_of(k) == Some(ci.path.as_str()))
                                     .map(|(k, _)| k.clone())
                                     .collect();
+                                (unr, kids)
+                            };
+                            let ci_bytes = cur.rows.get(&ci.path).map_or(0, |r| r.bytes);
+                            if !ci_unreadable && ci_depth < cfg.max_depth && ci_bytes >= cfg.record_min_bytes {
                                 if child_dirs.len() <= cfg.max_children {
                                     for cdir in child_dirs {
                                         if diskledger::report::REGENERABLE.contains(&diskledger::util::base_name(&ci.path)) {

@@ -18,7 +18,7 @@ pub struct DirListing {
     pub has_git: bool,
 }
 
-pub trait System {
+pub trait System: Send + Sync {
     fn query(&self, path: &Path) -> io::Result<DirStat>;
     fn flag(&self, path: &Path) -> io::Result<()>;
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)>;
