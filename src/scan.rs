@@ -84,7 +84,7 @@ pub fn run(sys: &dyn System, cfg: &Config, prev: Option<&Snapshot>, opts: &ScanO
                         got_vol = true;
                     }
                 }
-                cx.visit(root, 0, dev);
+                cx.visit(root, 0, dev, false);
             }
             Ok(None) => cx.rep.errors.push(format!("{}: not a directory", root.display())),
             Err(e) => cx.rep.errors.push(format!("{}: {e}", root.display())),
@@ -103,16 +103,22 @@ pub fn run(sys: &dyn System, cfg: &Config, prev: Option<&Snapshot>, opts: &ScanO
     cx.rep
 }
 
+struct VisitRes {
+    covered: u64,
+    bytes: u64,
+    entries_plus_self: u64,
+}
+
 impl Ctx<'_> {
-    /// Returns how many entries at or below `path` are covered by a kernel
-    /// record, so the caller can tell how much of itself is still unrecorded.
-    fn visit(&mut self, path: &Path, depth: u32, dev: u64) -> u64 {
+    /// Visit `path` and return its covered entry count plus exact APFS totals
+    /// so the parent can tighten its remaining byte/entry budget.
+    fn visit(&mut self, path: &Path, depth: u32, dev: u64, parent_needs_covered: bool) -> VisitRes {
         let key = normalize_path_str(&path.to_string_lossy());
         let mut st = match self.sys.query(path) {
             Ok(s) => s,
             Err(e) => {
                 self.rep.errors.push(format!("{key}: {e}"));
-                return 0;
+                return VisitRes { covered: 0, bytes: 0, entries_plus_self: 0 };
             }
         };
         self.rep.queried += 1;
@@ -121,7 +127,11 @@ impl Ctx<'_> {
         }
 
         if st.has_record && self.reuse_unchanged(&key, &st, depth) {
-            return st.entries + 1;
+            return VisitRes {
+                covered: st.entries + 1,
+                bytes: st.bytes,
+                entries_plus_self: st.entries + 1,
+            };
         }
 
         let mut covered = 0u64;
@@ -134,16 +144,81 @@ impl Ctx<'_> {
             match self.sys.list_dir(path, self.cfg.max_children) {
                 Ok(listing) => {
                     has_git = Some(listing.has_git);
-                    for child in listing.subdirs {
+                    // Visit previously-flagged and previously-large children first so
+                    // their exact bytes/entries tighten the remaining budget immediately
+                    // before we pay for kernel walks on small unflagged siblings.
+                    let mut children: Vec<(std::path::PathBuf, String, u8, u64)> = listing
+                        .subdirs
+                        .into_iter()
+                        .map(|c| {
+                            let ck = normalize_path_str(&c.to_string_lossy());
+                            let (tier, prev_bytes) = match self.prev.and_then(|p| p.rows.get(&ck)) {
+                                Some(r) if r.flagged => (0u8, r.bytes),
+                                Some(r) => (1u8, r.bytes),
+                                None => (2u8, 0),
+                            };
+                            (c, ck, tier, prev_bytes)
+                        })
+                        .collect();
+                    children.sort_by(|a, b| {
+                        a.2.cmp(&b.2)
+                            .then_with(|| b.3.cmp(&a.3))
+                            .then_with(|| a.1.cmp(&b.1))
+                    });
+
+                    let mut visited_bytes = 0u64;
+                    let mut visited_entries = 0u64;
+                    let child_needs_covered = !st.has_record && depth > 0;
+                    let mut pruned_idx = None;
+
+                    for (idx, (child, child_key, _, _)) in children.iter().enumerate() {
+                        let rem_bytes = st.bytes.saturating_sub(visited_bytes);
+                        let rem_entries = st.entries.saturating_sub(visited_entries);
+                        let p_definitely_pending_or_flagged = st.has_record
+                            || depth == 0
+                            || st.entries.saturating_sub(covered.saturating_add(rem_entries))
+                                >= self.cfg.flag_min_entries;
+                        let p_definitely_not_pending = !st.has_record
+                            && depth > 0
+                            && st.entries.saturating_sub(covered) < self.cfg.flag_min_entries;
+                        let covered_irrelevant = p_definitely_pending_or_flagged
+                            || (!parent_needs_covered && p_definitely_not_pending)
+                            || rem_entries == 0;
+
+                        if rem_bytes < self.cfg.record_min_bytes
+                            && rem_entries < self.cfg.flag_min_entries
+                            && covered_irrelevant
+                        {
+                            pruned_idx = Some(idx);
+                            break;
+                        }
+
                         // Stay on the root's volume.
-                        if self.sys.symlink_dev(&child).map(|d| d == dev).unwrap_or(false) {
-                            let child_key = normalize_path_str(&child.to_string_lossy());
-                            covered += self.visit(&child, depth + 1, dev);
+                        if self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false) {
+                            let res = self.visit(child, depth + 1, dev, child_needs_covered);
+                            covered += res.covered;
+                            visited_bytes = visited_bytes.saturating_add(res.bytes);
+                            visited_entries = visited_entries.saturating_add(res.entries_plus_self);
                             if is_regen
-                                && !self.rep.snapshot.rows.contains_key(&child_key)
-                                && self.sys.has_git(&child)
+                                && !self.rep.snapshot.rows.contains_key(child_key)
+                                && self.sys.has_git(child)
                             {
-                                self.rep.snapshot.extra_git_repos.insert(child_key);
+                                self.rep.snapshot.extra_git_repos.insert(child_key.clone());
+                            }
+                        }
+                    }
+
+                    // Even when remaining children are pruned from kernel walks, preserve
+                    // direct-child `.git` detection under regenerable directories.
+                    if is_regen {
+                        if let Some(start) = pruned_idx {
+                            for (child, child_key, _, _) in &children[start..] {
+                                if self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false)
+                                    && !self.rep.snapshot.rows.contains_key(child_key)
+                                    && self.sys.has_git(child)
+                                {
+                                    self.rep.snapshot.extra_git_repos.insert(child_key.clone());
+                                }
                             }
                         }
                     }
@@ -192,10 +267,15 @@ impl Ctx<'_> {
         }
         // A pending directory counts as covered so that a read-only scan
         // predicts the same set a flagging scan would produce.
-        if st.has_record || pending {
+        let out_covered = if st.has_record || pending {
             st.entries + 1
         } else {
             covered
+        };
+        VisitRes {
+            covered: out_covered,
+            bytes: st.bytes,
+            entries_plus_self: st.entries + 1,
         }
     }
 

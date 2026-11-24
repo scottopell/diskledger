@@ -42,6 +42,7 @@ impl Drop for TempHome {
 struct OpCounts {
     queries: u64,
     walks: u64,
+    walked_entries: u64,
     flags: u64,
     list_dirs: u64,
     has_git: u64,
@@ -287,6 +288,7 @@ impl System for FakeFs {
         ops.queries += 1;
         if !st.has_record {
             ops.walks += 1;
+            ops.walked_entries += st.entries;
         }
         Ok(st)
     }
@@ -1163,5 +1165,80 @@ proptest! {
         prop_assert!(text.contains("  a"), "shrinking child 'a' missing:\n{text}");
         prop_assert!(text.contains("  b"), "growing child 'b' missing:\n{text}");
         prop_assert!(!text.contains("nothing changed"), "falsely claimed nothing changed:\n{text}");
+    }
+
+    /// Structural walk-bound invariant: when a dirty flagged parent's remaining
+    /// uncovered bytes (< record_min_bytes) and entries (< flag_min_entries) are
+    /// exhausted by its flagged children, scan must incur ZERO kernel walks on
+    /// any number of unflagged sibling directories, while still preserving exact
+    /// snapshot parity with a full scan (including `.git` detection under regen dirs).
+    #[test]
+    fn budget_pruning_skips_all_unflagged_siblings(
+        n_siblings in 5usize..40,
+        flagged_bytes in (100u64 << 20)..(500u64 << 20),
+        sibling_bytes in 1u64..(128u64 << 10),
+        parent_is_regen in any::<bool>(),
+        git_sibling_idx in 0usize..40,
+    ) {
+        let fs = FakeFs::new(1_795_000_000);
+        let root = if parent_is_regen { "/vol/build" } else { "/vol/proj" };
+        fs.mkdir("/vol", 1);
+        fs.mkdir(root, 1);
+        let big = format!("{root}/big_flagged");
+        fs.mkdir(&big, 1);
+        fs.write_file(&format!("{big}/blob.bin"), flagged_bytes);
+        // Flag both big child and root.
+        fs.flag(Path::new(&big)).unwrap();
+        fs.flag(Path::new(root)).unwrap();
+
+        let git_idx = git_sibling_idx % n_siblings;
+        for i in 0..n_siblings {
+            let sib = format!("{root}/small_{i:02}");
+            fs.mkdir(&sib, 1);
+            fs.write_file(&format!("{sib}/tiny.txt"), sibling_bytes);
+            if i == git_idx {
+                fs.write_file(&format!("{sib}/.git"), 64);
+            }
+        }
+
+        let cfg = Config {
+            roots: vec![PathBuf::from(root)],
+            flag_min_entries: 5_000,
+            record_min_bytes: 64 << 20,
+            max_depth: 6,
+            max_children: 200,
+            keep_snapshots: 5,
+        };
+
+        // Initial snapshot records `root` and `big_flagged` as flagged.
+        let prev = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }).snapshot;
+        // Mutate inside `big_flagged` so `root` and `big_flagged` both become dirty!
+        fs.write_file(&format!("{big}/delta.bin"), 4096);
+
+        let before = fs.ops_snapshot();
+        let rep = scan::run(&fs, &cfg, Some(&prev), &ScanOpts { flag: false, verbose: false });
+        let after = fs.ops_snapshot();
+
+        prop_assert_eq!(
+            after.walks - before.walks,
+            0,
+            "dirty flagged parent with <record_min_bytes and <flag_min_entries remaining must do 0 walks on {} unflagged siblings",
+            n_siblings
+        );
+        prop_assert_eq!(after.walked_entries - before.walked_entries, 0);
+        prop_assert_eq!(
+            after.queries - before.queries,
+            2,
+            "should only query root and big_flagged"
+        );
+
+        // Must still match a full scan on rows and extra_git_repos.
+        let full = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false });
+        prop_assert_eq!(rep.snapshot.rows, full.snapshot.rows);
+        prop_assert_eq!(&rep.snapshot.extra_git_repos, &full.snapshot.extra_git_repos);
+        if parent_is_regen {
+            let expected_git = format!("{root}/small_{git_idx:02}");
+            prop_assert!(rep.snapshot.extra_git_repos.contains(&expected_git));
+        }
     }
 }
