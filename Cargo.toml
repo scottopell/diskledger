@@ -9,6 +9,10 @@ description = "Directory-size ledger for macOS/APFS: checkpoints, diffs, and ker
 [dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"
+
 [profile.release]
 opt-level = 3
 strip = true

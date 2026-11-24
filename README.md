@@ -42,9 +42,10 @@ diskledger diff                # what changed since the last checkin
 | `top [dir]` | Largest directories | Snapshot only |
 | `candidates` | Directories named like build output, with how long unchanged | Snapshot only |
 | `status` | Free space, roots, snapshots, checkpoints | No |
+| `doctor` | Verify the private APFS `fsctl` ABI against `apfs.util -S` | Temp dir only |
 | `agent install` | Run `scan` every 15 minutes through launchd | Installs a LaunchAgent |
 
-Add `--json` to `diff`, `size`, `top`, `candidates` and `status` for agents.
+Add `--json` to `diff`, `size`, `top`, `candidates`, `status` and `doctor` for agents.
 
 `size` needs no config and works on any path, monitored or not. On a flagged
 directory it answers from the kernel record; elsewhere the kernel walks the
@@ -77,7 +78,8 @@ Add `--no-scan` to report from the latest stored snapshot without touching the d
 - **Very recent writes can lag** until they reach the disk.
 - **The kernel interface is private to Apple** and could change in a macOS
   update. The struct layout in `src/kstat.rs` was read from `apfs.util` on
-  macOS 26.5.
+  macOS 26.5. Run `diskledger doctor` after a macOS update to verify `fsctl`
+  still matches `apfs.util -S`.
 - `candidates` matches by directory name. It does not check whether a
   process is using the directory or who owns it. A matched directory that
   holds git repositories is listed under `mixed`, not as a candidate; its
