@@ -453,6 +453,42 @@ impl<'a> SharedCtx<'a> {
         pool: Option<&Pool<'a>>,
     ) -> VisitRes {
         let key = normalize_path_str(&path.to_string_lossy());
+
+        // Bottom-up fast path for previously-unflagged large container directories
+        // that have no direct regular files and a small set of subdirectories:
+        // summing the children directly avoids a redundant full-subtree kernel walk
+        // on the parent before walking those same children.
+        let mut prefetched_listing: Option<crate::sys::DirListing> = None;
+        if prefetched.is_none() && !self.opts.flag && depth > 0 && depth < self.cfg.max_depth {
+            if let Some(old) = self.prev.and_then(|p| p.rows.get(&key)) {
+                if !old.flagged && old.bytes >= self.cfg.record_min_bytes {
+                    if let Ok(listing) = self.sys.list_dir(path, self.cfg.max_children) {
+                        let unknown_kids = listing
+                            .subdirs
+                            .iter()
+                            .filter(|c| {
+                                let ck = normalize_path_str(&c.to_string_lossy());
+                                !self.prev.map_or(false, |p| p.rows.contains_key(&ck))
+                            })
+                            .count();
+                        if !listing.too_many_children
+                            && !listing.has_direct_files
+                            && (unknown_kids == 0 || listing.subdirs.len() <= 16)
+                        {
+                            return self.visit_container_bottom_up(
+                                &key,
+                                depth,
+                                dev,
+                                listing,
+                                pool,
+                            );
+                        }
+                        prefetched_listing = Some(listing);
+                    }
+                }
+            }
+        }
+
         let mut st = match prefetched {
             Some(s) => s,
             None => match self.sys.query(path) {
@@ -485,7 +521,11 @@ impl<'a> SharedCtx<'a> {
         // flags the parent, so flagging bottom-up walks each file once instead
         // of once per level.
         if st.bytes >= self.cfg.record_min_bytes && depth < self.cfg.max_depth {
-            match self.sys.list_dir(path, self.cfg.max_children) {
+            let listing_res = match prefetched_listing {
+                Some(l) => Ok(l),
+                None => self.sys.list_dir(path, self.cfg.max_children),
+            };
+            match listing_res {
                 Ok(listing) => {
                     has_git = Some(listing.has_git);
                     // Order children: Tier 0 = previously flagged, Tier 1 = previously recorded,
@@ -697,8 +737,7 @@ impl<'a> SharedCtx<'a> {
         }
     }
 
-    /// If the kernel's change counter says nothing beneath `key` changed since
-    /// the previous snapshot, copy that snapshot's rows and skip the subtree.
+    /// Execute a batch of child tasks either in parallel via `pool` or inline.
     fn run_child_tasks(
         &self,
         tasks: Vec<ChildTask>,
@@ -798,6 +837,108 @@ impl<'a> SharedCtx<'a> {
                 }
             }
             budget
+        }
+    }
+
+    /// Compute an unflagged, zero-direct-file container directory's exact APFS
+    /// totals bottom-up from its same-volume subdirectories without issuing a
+    /// redundant kernel walk on the parent first.
+    fn visit_container_bottom_up(
+        &self,
+        key: &str,
+        depth: u32,
+        dev: u64,
+        listing: crate::sys::DirListing,
+        pool: Option<&Pool<'a>>,
+    ) -> VisitRes {
+        let is_regen = REGENERABLE.contains(&base_name(key));
+        let mut tasks: Vec<ChildTask> = Vec::with_capacity(listing.subdirs.len());
+        for child in listing.subdirs {
+            if !self.sys.symlink_dev(&child).map(|d| d == dev).unwrap_or(false) {
+                continue;
+            }
+            let ck = normalize_path_str(&child.to_string_lossy());
+            tasks.push(ChildTask {
+                path: child,
+                key: ck,
+                prefetched: None,
+                already_accounted: false,
+            });
+        }
+
+        // No budget pruning here because parent totals are computed from children.
+        // Pass dummy max DirStat so `can_prune` never fires.
+        let sentinel = DirStat { has_record: false, gen: 0, entries: u64::MAX, bytes: u64::MAX };
+        let budget = if tasks.is_empty() {
+            Budget { covered: 0, visited_bytes: 0, visited_entries: 0 }
+        } else {
+            self.run_child_tasks(
+                tasks,
+                Budget { covered: 0, visited_bytes: 0, visited_entries: 0 },
+                sentinel,
+                depth,
+                dev,
+                true,
+                true,
+                is_regen,
+                pool,
+            )
+        };
+
+        let st = DirStat {
+            has_record: false,
+            gen: 0,
+            entries: budget.visited_entries,
+            bytes: budget.visited_bytes,
+        };
+        let uncovered = st.entries.saturating_sub(budget.covered);
+        let pending = uncovered >= self.cfg.flag_min_entries;
+
+        if st.bytes < self.cfg.record_min_bytes {
+            // Directory shrank below record_min_bytes since `prev`: a full scan would
+            // not have descended into it, so drop any descendant rows/would_flag recorded.
+            let mut out = self.out.lock().unwrap();
+            let prefix = format!("{key}/");
+            out.rows.retain(|k, _| !k.starts_with(&prefix));
+            out.would_flag.retain(|k| !k.starts_with(&prefix));
+            out.extra_git_repos.retain(|k| !k.starts_with(&prefix));
+            if pending {
+                out.would_flag.push(key.to_string());
+                out.rows.insert(
+                    key.to_string(),
+                    Row {
+                        bytes: st.bytes,
+                        entries: st.entries,
+                        gen: 0,
+                        flagged: false,
+                        pending: true,
+                        has_git: listing.has_git,
+                    },
+                );
+            }
+        } else {
+            let mut out = self.out.lock().unwrap();
+            if pending {
+                out.would_flag.push(key.to_string());
+            }
+            out.rows.insert(
+                key.to_string(),
+                Row {
+                    bytes: st.bytes,
+                    entries: st.entries,
+                    gen: 0,
+                    flagged: false,
+                    pending,
+                    has_git: listing.has_git,
+                },
+            );
+        }
+
+        let out_covered = if pending { st.entries + 1 } else { budget.covered };
+        VisitRes {
+            covered: out_covered,
+            bytes: st.bytes,
+            entries_plus_self: st.entries + 1,
         }
     }
 

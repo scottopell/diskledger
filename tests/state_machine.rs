@@ -241,13 +241,7 @@ impl FakeFs {
                 }
             }
         }
-        for spath in st.symlinks.keys() {
-            if let Some(par) = parent_of(spath) {
-                if reachable.contains(par) {
-                    entries += 1;
-                }
-            }
-        }
+        // Real APFS dir-stats `descendants` counts regular files and directories, not symlinks.
         Some(DirStat {
             has_record: root_dir.flagged,
             gen: if root_dir.flagged { root_dir.gen } else { 0 },
@@ -380,16 +374,22 @@ impl System for FakeFs {
         }
         let git_path = if p == "/" { "/.git".to_string() } else { format!("{p}/.git") };
         let has_git = st.files.contains_key(&git_path) || st.dirs.contains_key(&git_path);
+        let has_direct_files = st.files.keys().any(|k| parent_of(k) == Some(p.as_str()));
         let mut subdirs = Vec::new();
         for k in st.dirs.keys() {
             if parent_of(k) == Some(p.as_str()) {
                 subdirs.push(PathBuf::from(k));
                 if subdirs.len() > max_children {
-                    return Ok(DirListing { subdirs: Vec::new(), too_many_children: true, has_git });
+                    return Ok(DirListing {
+                        subdirs: Vec::new(),
+                        too_many_children: true,
+                        has_git,
+                        has_direct_files,
+                    });
                 }
             }
         }
-        Ok(DirListing { subdirs, too_many_children: false, has_git })
+        Ok(DirListing { subdirs, too_many_children: false, has_git, has_direct_files })
     }
 
     fn has_git(&self, path: &Path) -> bool {
@@ -1295,5 +1295,58 @@ proptest! {
             let expected_git = format!("{root}/small_{git_idx:02}");
             prop_assert!(rep.snapshot.extra_git_repos.contains(&expected_git));
         }
+    }
+
+    /// Structural walk-bound invariant: a chain of nested unflagged zero-direct-file
+    /// container directories sitting above a flagged subtree must incur ZERO kernel
+    /// walks on an incremental read-only scan, while matching a full scan identically.
+    #[test]
+    fn bottom_up_container_chain_avoids_redundant_parent_walks(
+        chain_len in 1usize..=5,
+        leaf_bytes in (80u64 << 20)..(200u64 << 20),
+        delta_bytes in 1u64..(4u64 << 20),
+    ) {
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/vol", 1);
+        fs.mkdir("/vol/root", 1);
+        let mut cur = "/vol/root".to_string();
+        for i in 0..chain_len {
+            cur = format!("{cur}/c{i}");
+            fs.mkdir(&cur, 1);
+        }
+        let leaf = format!("{cur}/leaf_flagged");
+        fs.mkdir(&leaf, 1);
+        fs.write_file(&format!("{leaf}/blob.bin"), leaf_bytes);
+        fs.flag(Path::new(&leaf)).unwrap();
+        fs.flag(Path::new("/vol/root")).unwrap();
+
+        let cfg = Config {
+            roots: vec![PathBuf::from("/vol/root")],
+            flag_min_entries: 5_000,
+            record_min_bytes: 64 << 20,
+            max_depth: 10,
+            max_children: 64,
+            keep_snapshots: 5,
+        };
+
+        let prev = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }).snapshot;
+        // Mutate inside the flagged leaf so `/vol/root` and `leaf` are dirty.
+        fs.write_file(&format!("{leaf}/delta.bin"), delta_bytes);
+
+        let before = fs.ops_snapshot();
+        let rep = scan::run(&fs, &cfg, Some(&prev), &ScanOpts { flag: false, verbose: false });
+        let after = fs.ops_snapshot();
+
+        prop_assert_eq!(
+            after.walks - before.walks,
+            0,
+            "chain of {} unflagged zero-file container dirs must incur 0 kernel walks",
+            chain_len
+        );
+        prop_assert_eq!(after.walked_entries - before.walked_entries, 0);
+
+        let full = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false });
+        prop_assert_eq!(rep.snapshot.rows, full.snapshot.rows);
+        prop_assert_eq!(rep.would_flag, full.would_flag);
     }
 }

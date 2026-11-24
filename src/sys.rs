@@ -3,8 +3,10 @@
 
 use crate::kstat::{self, DirStat};
 use crate::util;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -16,6 +18,9 @@ pub struct DirListing {
     pub too_many_children: bool,
     /// True when a direct `.git` entry (file or directory) exists inside this directory.
     pub has_git: bool,
+    /// True when the directory contains at least one direct non-directory, non-symlink entry
+    /// (e.g. a regular file, FIFO, or unknown entry type).
+    pub has_direct_files: bool,
 }
 
 pub trait System: Send + Sync {
@@ -64,15 +69,59 @@ impl System for RealSystem {
     }
 
     fn list_dir(&self, path: &Path, max_children: usize) -> io::Result<DirListing> {
-        let rd = fs::read_dir(path)?;
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let raw = unsafe { libc::opendir(c.as_ptr()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let _guard = DirGuard(raw);
         let mut out = DirListing::default();
-        for ent in rd.flatten() {
-            if ent.file_name() == ".git" {
+
+        loop {
+            let ent = unsafe { libc::readdir(raw) };
+            if ent.is_null() {
+                break;
+            }
+            let (name_bytes, d_type) = unsafe {
+                let d = &*ent;
+                let bytes = CStr::from_ptr(d.d_name.as_ptr()).to_bytes();
+                (bytes, d.d_type)
+            };
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            if name_bytes == b".git" {
                 out.has_git = true;
             }
-            // file_type() does not follow symlinks.
-            if ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                out.subdirs.push(ent.path());
+            let is_dir = match d_type {
+                libc::DT_DIR => true,
+                libc::DT_LNK => false,
+                libc::DT_UNKNOWN => {
+                    let child = path.join(OsStr::from_bytes(name_bytes));
+                    match fs::symlink_metadata(&child) {
+                        Ok(m) if m.is_dir() => true,
+                        Ok(m) if m.file_type().is_symlink() => false,
+                        _ => {
+                            out.has_direct_files = true;
+                            false
+                        }
+                    }
+                }
+                _ => {
+                    out.has_direct_files = true;
+                    false
+                }
+            };
+            if is_dir {
+                out.subdirs.push(path.join(OsStr::from_bytes(name_bytes)));
                 if out.subdirs.len() > max_children {
                     out.subdirs.clear();
                     out.too_many_children = true;
