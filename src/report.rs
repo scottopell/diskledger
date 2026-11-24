@@ -1,12 +1,16 @@
 //! Pure report computation plus human and JSON rendering for diff, top, and candidates.
 
 use crate::store::{Snapshot, Store};
+use crate::sys::System;
 use crate::util::{
     base_name, fmt_age, fmt_ts, human, human_delta, is_same_or_under, is_under, json_str,
-    parent_of,
+    normalize_path_str, parent_of, Res,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Directory names that usually hold regenerable output.
 pub const REGENERABLE: &[&str] = &[
@@ -67,6 +71,15 @@ pub struct DiffReport {
     pub monitored_delta: i64,
     /// None when roots span multiple volumes so a single free-space delta does not apply.
     pub outside_delta: Option<i64>,
+    /// Change in sibling APFS container volumes (e.g. VM swapfile, System, Preboot).
+    pub other_volumes_delta: Option<i64>,
+    /// Change in unmonitored space strictly on this volume (`outside_delta - other_volumes_delta`).
+    pub unmonitored_volume_delta: Option<i64>,
+    pub purgeable_before: Option<u64>,
+    pub purgeable_after: Option<u64>,
+    pub purgeable_delta: Option<i64>,
+    pub apfs_snapshots_before: Option<u64>,
+    pub apfs_snapshots_after: Option<u64>,
     pub min_bytes: u64,
     pub not_in_baseline: Vec<(String, u64)>,
     pub no_longer_monitored: Vec<(String, u64)>,
@@ -130,11 +143,32 @@ pub fn compute_diff(base: &Snapshot, cur: &Snapshot, min: u64) -> DiffReport {
         .map(|r| bytes_of(cur, r) as i64 - bytes_of(base, r) as i64)
         .sum();
     let free_delta = cur.free as i64 - base.free as i64;
-    let outside_delta = if base.single_volume && cur.single_volume {
+    let single_vol = base.single_volume && cur.single_volume;
+    let outside_delta = if single_vol {
         Some(-free_delta - monitored_delta)
     } else {
         None
     };
+    let other_volumes_delta = if single_vol {
+        match (base.other_volumes_used(), cur.other_volumes_used()) {
+            (Some(b), Some(c)) => Some(c as i64 - b as i64),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let unmonitored_volume_delta = match (outside_delta, other_volumes_delta) {
+        (Some(out), Some(other)) => Some(out - other),
+        _ => None,
+    };
+    let purgeable_before = if single_vol { base.purgeable } else { None };
+    let purgeable_after = if single_vol { cur.purgeable } else { None };
+    let purgeable_delta = match (purgeable_before, purgeable_after) {
+        (Some(b), Some(c)) => Some(c as i64 - b as i64),
+        _ => None,
+    };
+    let apfs_snapshots_before = if single_vol { base.apfs_snapshots } else { None };
+    let apfs_snapshots_after = if single_vol { cur.apfs_snapshots } else { None };
 
     let mut changes: Vec<DiffRow> = rows
         .values()
@@ -156,6 +190,13 @@ pub fn compute_diff(base: &Snapshot, cur: &Snapshot, min: u64) -> DiffReport {
         free_delta,
         monitored_delta,
         outside_delta,
+        other_volumes_delta,
+        unmonitored_volume_delta,
+        purgeable_before,
+        purgeable_after,
+        purgeable_delta,
+        apfs_snapshots_before,
+        apfs_snapshots_after,
         min_bytes: min,
         not_in_baseline,
         no_longer_monitored,
@@ -182,20 +223,25 @@ impl DiffReport {
                 )
             })
             .collect();
-        let outside = match self.outside_delta {
-            Some(v) => v.to_string(),
-            None => "null".to_string(),
-        };
+        let opt_i64 = |v: Option<i64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
+        let opt_u64 = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
         writeln!(
             w,
-            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"monitored_delta\":{},\"outside_delta\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"no_longer_monitored\":[{}],\"changes\":[{}]}}",
+            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"monitored_delta\":{},\"outside_delta\":{},\"unmonitored_volume_delta\":{},\"other_volumes_delta\":{},\"purgeable_before\":{},\"purgeable_after\":{},\"purgeable_delta\":{},\"apfs_snapshots_before\":{},\"apfs_snapshots_after\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"no_longer_monitored\":[{}],\"changes\":[{}]}}",
             self.since,
             self.now,
             self.free_before,
             self.free_after,
             self.free_delta,
             self.monitored_delta,
-            outside,
+            opt_i64(self.outside_delta),
+            opt_i64(self.unmonitored_volume_delta),
+            opt_i64(self.other_volumes_delta),
+            opt_u64(self.purgeable_before),
+            opt_u64(self.purgeable_after),
+            opt_i64(self.purgeable_delta),
+            opt_u64(self.apfs_snapshots_before),
+            opt_u64(self.apfs_snapshots_after),
             self.min_bytes,
             skipped.join(","),
             removed.join(","),
@@ -250,16 +296,54 @@ impl DiffReport {
         }
         match self.outside_delta {
             Some(out) => {
-                writeln!(
-                    w,
-                    "Monitored folders changed by {}; everything else on the volume by {}.",
-                    human_delta(self.monitored_delta),
-                    human_delta(out)
-                )?;
-                if out.unsigned_abs() >= self.min_bytes.max(256 << 20) {
+                match (self.unmonitored_volume_delta, self.other_volumes_delta) {
+                    (Some(unmon), Some(other)) if other.unsigned_abs() >= (64 << 20) => {
+                        writeln!(
+                            w,
+                            "Monitored folders changed by {}; unmonitored space on this volume by {}; other container volumes (VM/System) by {}.",
+                            human_delta(self.monitored_delta),
+                            human_delta(unmon),
+                            human_delta(other)
+                        )?;
+                    }
+                    _ => {
+                        writeln!(
+                            w,
+                            "Monitored folders changed by {}; everything else on the volume by {}.",
+                            human_delta(self.monitored_delta),
+                            human_delta(out)
+                        )?;
+                    }
+                }
+                if let (Some(pb), Some(pa), Some(pd)) =
+                    (self.purgeable_before, self.purgeable_after, self.purgeable_delta)
+                {
+                    if pd.unsigned_abs() >= (64 << 20) || (pa >= (512 << 20) && out > 0) {
+                        writeln!(
+                            w,
+                            "  APFS purgeable space: {} -> {} ({}).",
+                            human(pb),
+                            human(pa),
+                            human_delta(pd)
+                        )?;
+                    }
+                }
+                if let (Some(sb), Some(sa)) =
+                    (self.apfs_snapshots_before, self.apfs_snapshots_after)
+                {
+                    if sa > 0 || sb != sa {
+                        writeln!(
+                            w,
+                            "  Local APFS snapshots: {} -> {} (snapshots can pin freed blocks).",
+                            sb, sa
+                        )?;
+                    }
+                }
+                let actionable = self.unmonitored_volume_delta.unwrap_or(out);
+                if actionable.unsigned_abs() >= self.min_bytes.max(256 << 20) {
                     writeln!(
                         w,
-                        "  That is space used outside the monitored folders. Find it with 'diskledger size <path>' or add the folder as a root."
+                        "  Hunt unmonitored space with 'diskledger size -c ~' or track a folder with 'diskledger root add <path>'."
                     )?;
                 }
             }
@@ -674,4 +758,318 @@ pub fn candidates(store: &Store, cur: &Snapshot, min: u64, json: bool) {
     let rep = compute_candidates(store, cur, min);
     let mut out = io::stdout().lock();
     let _ = if json { rep.render_json(&mut out) } else { rep.render_human(&mut out) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MonitoredState {
+    Unmonitored,
+    Partial,
+    Covered,
+}
+
+impl MonitoredState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MonitoredState::Unmonitored => "none",
+            MonitoredState::Partial => "partial",
+            MonitoredState::Covered => "covered",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SizeChildrenOpts {
+    pub min_bytes: u64,
+    pub limit: Option<usize>,
+    pub unmonitored_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSizeRow {
+    pub path: String,
+    pub bytes: u64,
+    pub unmonitored_bytes: u64,
+    pub entries: u64,
+    pub instant: bool,
+    pub is_dir: bool,
+    pub monitored: MonitoredState,
+}
+
+impl ChildSizeRow {
+    pub fn shown_bytes(&self, unmonitored_only: bool) -> u64 {
+        if unmonitored_only { self.unmonitored_bytes } else { self.bytes }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SizeChildrenReport {
+    pub dir: String,
+    pub unmonitored_only: bool,
+    pub min_bytes: u64,
+    pub total_bytes: u64,
+    pub omitted_count: usize,
+    pub omitted_bytes: u64,
+    pub entries: Vec<ChildSizeRow>,
+    pub errors: Vec<String>,
+}
+
+pub fn compute_size_children(
+    sys: &dyn System,
+    dir: &Path,
+    roots: &[String],
+    opts: &SizeChildrenOpts,
+) -> Res<SizeChildrenReport> {
+    let dir_key = normalize_path_str(&dir.to_string_lossy());
+    let parent_dev = match sys.dir_dev(dir) {
+        Ok(Some(d)) => d,
+        Ok(None) => return Err(format!("{dir_key}: not a directory")),
+        Err(e) => return Err(format!("{dir_key}: {e}")),
+    };
+    let raw_entries = sys.list_entries(dir).map_err(|e| format!("{dir_key}: {e}"))?;
+
+    struct WorkItem {
+        path: std::path::PathBuf,
+        key: String,
+        is_dir: bool,
+        file_bytes: u64,
+        monitored: MonitoredState,
+        nested_roots: Vec<String>,
+    }
+
+    let mut work: Vec<WorkItem> = Vec::with_capacity(raw_entries.len());
+    for ent in raw_entries {
+        if ent.dev != parent_dev {
+            continue;
+        }
+        let key = normalize_path_str(&ent.path.to_string_lossy());
+        let covered = roots.iter().any(|r| is_same_or_under(&key, r));
+        if covered && opts.unmonitored_only {
+            continue;
+        }
+        let (monitored, nested_roots) = if covered {
+            (MonitoredState::Covered, Vec::new())
+        } else if ent.is_dir {
+            let nested: Vec<String> = roots
+                .iter()
+                .filter(|r| is_under(r, &key))
+                .cloned()
+                .collect();
+            if nested.is_empty() {
+                (MonitoredState::Unmonitored, Vec::new())
+            } else {
+                (MonitoredState::Partial, nested)
+            }
+        } else {
+            (MonitoredState::Unmonitored, Vec::new())
+        };
+        work.push(WorkItem {
+            path: ent.path,
+            key,
+            is_dir: ent.is_dir,
+            file_bytes: ent.file_bytes,
+            monitored,
+            nested_roots,
+        });
+    }
+
+    let results: Mutex<Vec<ChildSizeRow>> = Mutex::new(Vec::with_capacity(work.len()));
+    let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 6))
+        .unwrap_or(4)
+        .min(work.len().max(1));
+
+    let run_worker = || {
+        loop {
+            let idx = next.fetch_add(1, Ordering::Relaxed);
+            if idx >= work.len() {
+                break;
+            }
+            let item = &work[idx];
+            if item.is_dir {
+                match sys.query(&item.path) {
+                    Ok(st) => {
+                        let unmon = match item.monitored {
+                            MonitoredState::Covered => 0,
+                            MonitoredState::Unmonitored => st.bytes,
+                            MonitoredState::Partial => {
+                                let mut mon_sum = 0u64;
+                                for r in &item.nested_roots {
+                                    if let Ok(rs) = sys.query(Path::new(r)) {
+                                        mon_sum = mon_sum.saturating_add(rs.bytes);
+                                    }
+                                }
+                                st.bytes.saturating_sub(mon_sum)
+                            }
+                        };
+                        results.lock().unwrap().push(ChildSizeRow {
+                            path: item.key.clone(),
+                            bytes: st.bytes,
+                            unmonitored_bytes: unmon,
+                            entries: st.entries,
+                            instant: st.has_record,
+                            is_dir: true,
+                            monitored: item.monitored,
+                        });
+                    }
+                    Err(e) => {
+                        errors.lock().unwrap().push(format!("{}: {e}", item.key));
+                    }
+                }
+            } else {
+                let unmon = if item.monitored == MonitoredState::Covered { 0 } else { item.file_bytes };
+                results.lock().unwrap().push(ChildSizeRow {
+                    path: item.key.clone(),
+                    bytes: item.file_bytes,
+                    unmonitored_bytes: unmon,
+                    entries: 0,
+                    instant: false,
+                    is_dir: false,
+                    monitored: item.monitored,
+                });
+            }
+        }
+    };
+
+    if threads <= 1 {
+        run_worker();
+    } else {
+        std::thread::scope(|s| {
+            for _ in 0..(threads - 1) {
+                s.spawn(run_worker);
+            }
+            run_worker();
+        });
+    }
+
+    let mut rows = results.into_inner().unwrap();
+    let mut errs = errors.into_inner().unwrap();
+    errs.sort();
+
+    rows.sort_by(|a, b| {
+        b.shown_bytes(opts.unmonitored_only)
+            .cmp(&a.shown_bytes(opts.unmonitored_only))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+
+    let total_bytes: u64 = rows
+        .iter()
+        .map(|r| r.shown_bytes(opts.unmonitored_only))
+        .sum();
+
+    let mut kept = Vec::new();
+    let mut omitted_count = 0usize;
+    let mut omitted_bytes = 0u64;
+    for r in rows {
+        let b = r.shown_bytes(opts.unmonitored_only);
+        let below_min = b < opts.min_bytes;
+        let over_limit = opts.limit.map_or(false, |lim| kept.len() >= lim);
+        if below_min || over_limit {
+            omitted_count += 1;
+            omitted_bytes = omitted_bytes.saturating_add(b);
+        } else {
+            kept.push(r);
+        }
+    }
+
+    Ok(SizeChildrenReport {
+        dir: dir_key,
+        unmonitored_only: opts.unmonitored_only,
+        min_bytes: opts.min_bytes,
+        total_bytes,
+        omitted_count,
+        omitted_bytes,
+        entries: kept,
+        errors: errs,
+    })
+}
+
+impl SizeChildrenReport {
+    pub fn render_json(&self, w: &mut impl Write) -> io::Result<()> {
+        let items: Vec<String> = self
+            .entries
+            .iter()
+            .map(|r| {
+                format!(
+                    "{{\"path\":{},\"bytes\":{},\"unmonitored_bytes\":{},\"entries\":{},\"instant\":{},\"is_dir\":{},\"monitored\":{}}}",
+                    json_str(&r.path),
+                    r.bytes,
+                    r.unmonitored_bytes,
+                    r.entries,
+                    r.instant,
+                    r.is_dir,
+                    json_str(r.monitored.as_str())
+                )
+            })
+            .collect();
+        let errs: Vec<String> = self.errors.iter().map(|e| json_str(e)).collect();
+        writeln!(
+            w,
+            "{{\"path\":{},\"unmonitored_only\":{},\"min_bytes\":{},\"total_bytes\":{},\"omitted_count\":{},\"omitted_bytes\":{},\"entries\":[{}],\"errors\":[{}]}}",
+            json_str(&self.dir),
+            self.unmonitored_only,
+            self.min_bytes,
+            self.total_bytes,
+            self.omitted_count,
+            self.omitted_bytes,
+            items.join(","),
+            errs.join(",")
+        )
+    }
+
+    pub fn render_kb(&self, w: &mut impl Write) -> io::Result<()> {
+        for r in &self.entries {
+            let b = r.shown_bytes(self.unmonitored_only);
+            writeln!(w, "{}\t{}", b.div_ceil(1024), r.path)?;
+        }
+        Ok(())
+    }
+
+    pub fn render_human(&self, w: &mut impl Write) -> io::Result<()> {
+        let hdr = if self.unmonitored_only { "UNMON" } else { "SIZE" };
+        writeln!(
+            w,
+            "{:>9} {:>9}  PATH   (* = instant kernel record)",
+            hdr, "ENTRIES"
+        )?;
+        for r in &self.entries {
+            let shown = r.shown_bytes(self.unmonitored_only);
+            let star = if r.instant { " *" } else { "" };
+            let tag = match (self.unmonitored_only, r.monitored) {
+                (false, MonitoredState::Covered) => "  [monitored]".to_string(),
+                (false, MonitoredState::Partial) => {
+                    format!("  [partial: {} unmonitored]", human(r.unmonitored_bytes))
+                }
+                (true, MonitoredState::Partial) => {
+                    format!("  [partial: of {} total]", human(r.bytes))
+                }
+                _ => String::new(),
+            };
+            writeln!(
+                w,
+                "{:>9} {:>9}  {}{}{}",
+                human(shown),
+                r.entries,
+                r.path,
+                star,
+                tag
+            )?;
+        }
+        if self.omitted_count > 0 {
+            writeln!(
+                w,
+                "  ... and {} smaller entries ({} total)",
+                self.omitted_count,
+                human(self.omitted_bytes)
+            )?;
+        }
+        writeln!(
+            w,
+            "Total{}: {} across {}",
+            if self.unmonitored_only { " (unmonitored)" } else { "" },
+            human(self.total_bytes),
+            self.dir
+        )
+    }
 }

@@ -12,6 +12,8 @@ diskledger: what grew, what shrank, and what could be freed (macOS / APFS)
 
 USAGE
   diskledger init <dir>...          Create the config with these monitored directories
+  diskledger root list|add|remove [dir...]
+                                    List, add, or remove monitored directories in the config
   diskledger scan [--dry-run] [--full]
                                     Record sizes and flag large directories for instant
                                     kernel totals. This is what the periodic job runs.
@@ -23,8 +25,13 @@ USAGE
                                     'checkin' checkpoint, else the previous snapshot.
   diskledger checkin                Mark now as the baseline for the next plain 'diff'
   diskledger checkpoint <name>      Save a named baseline
-  diskledger size <path>...         Size of any path right now, like 'du -s'. Instant for
+  diskledger size [-c] [-u] <path>...
+                                    Size of any path right now, like 'du -s'. Instant for
                                     flagged directories; otherwise the kernel walks it.
+                                    -c, --children lists immediate children sorted largest-first
+                                    (including dotfiles) and marks monitored roots.
+                                    -u, --unmonitored (with -c) skips monitored folders and
+                                    subtracts monitored subtrees from partial parents.
                                     -k prints 'KiB<TAB>path', the same as 'du -sk'.
   diskledger top [dir]              Largest directories in the latest snapshot
   diskledger candidates             Regenerable-looking directories (target, node_modules, ...)
@@ -35,8 +42,9 @@ USAGE
   diskledger --version
 
 OPTIONS
-  --json            Machine-readable output (diff, size, top, candidates, status, doctor)
+  --json            Machine-readable output (diff, size, top, candidates, status, root, doctor)
   --min SIZE        Smallest size or change to show, e.g. 100M, 2G
+  --limit N         Maximum rows to show in 'size -c'
   --depth N         Levels to show in 'top' (default 4)
   --no-scan         Use the latest stored snapshot; do not look at the disk
   --max-age DUR     Reuse the latest snapshot if newer than DUR (e.g. 60s, 5m)
@@ -44,6 +52,13 @@ OPTIONS
 
 Only 'scan' flags directories. Flagging cannot be undone and walks the directory once.
 State lives in $DISKLEDGER_HOME (default ~/.diskledger).";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootAction {
+    List { json: bool },
+    Add { dirs: Vec<String> },
+    Remove { dirs: Vec<String> },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
@@ -71,11 +86,20 @@ pub enum Command {
     Diff { since: Option<String>, min: u64, policy: ScanPolicy, json: bool },
     Checkin { policy: ScanPolicy },
     Checkpoint { name: String, policy: ScanPolicy },
-    Size { paths: Vec<String>, kb: bool, json: bool },
+    Size {
+        paths: Vec<String>,
+        children: bool,
+        unmonitored: bool,
+        min: u64,
+        limit: Option<usize>,
+        kb: bool,
+        json: bool,
+    },
     Top { under: Option<String>, min: u64, depth: usize, policy: ScanPolicy, json: bool },
     Candidates { min: u64, policy: ScanPolicy, json: bool },
     Status { json: bool },
     Doctor { json: bool },
+    Root { action: RootAction },
     Agent { action: AgentAction },
 }
 
@@ -291,11 +315,13 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             Ok(Command::Checkpoint { name, policy })
         }
         "size" => {
-            let t = tokenize(rest, &[])?;
+            let t = tokenize(rest, &["--min", "--limit"])?;
             if t.help {
                 return Ok(Command::Help);
             }
-            let (mut kb, mut json) = (false, false);
+            let (mut kb, mut json, mut children, mut unmonitored) = (false, false, false, false);
+            let mut min: Option<u64> = None;
+            let mut limit: Option<usize> = None;
             for (k, v) in t.opts {
                 match k.as_str() {
                     "-k" | "--kb" => {
@@ -306,13 +332,41 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                         require_no_val(&k, v)?;
                         json = true;
                     }
+                    "-c" | "--children" => {
+                        require_no_val(&k, v)?;
+                        children = true;
+                    }
+                    "-u" | "--unmonitored" => {
+                        require_no_val(&k, v)?;
+                        unmonitored = true;
+                    }
+                    "--min" => min = Some(parse_size(&require_val(&k, v)?)?),
+                    "--limit" => {
+                        let s = require_val(&k, v)?;
+                        let n: usize = s.parse().map_err(|_| "--limit needs a non-negative integer".to_string())?;
+                        limit = if n == 0 { None } else { Some(n) };
+                    }
                     _ => return Err(format!("unknown option '{k}' for 'size'")),
                 }
             }
-            if t.pos.is_empty() {
-                return Err("usage: diskledger size [-k] [--json] <path>...".into());
+            if !children && (unmonitored || min.is_some() || limit.is_some()) {
+                return Err("--unmonitored, --min, and --limit require --children (-c)".into());
             }
-            Ok(Command::Size { paths: t.pos, kb, json })
+            if t.pos.is_empty() {
+                return Err("usage: diskledger size [-c] [-u] [-k] [--json] <path>...".into());
+            }
+            if children && t.pos.len() > 1 {
+                return Err("usage: diskledger size -c [-u] [--min SIZE] [--limit N] <dir>".into());
+            }
+            Ok(Command::Size {
+                paths: t.pos,
+                children,
+                unmonitored,
+                min: min.unwrap_or(0),
+                limit,
+                kb,
+                json,
+            })
         }
         "top" => {
             let t = tokenize(rest, &["--min", "--depth", "--max-age"])?;
@@ -409,6 +463,53 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             reject_extra_pos("doctor", &t.pos, 0)?;
             Ok(Command::Doctor { json })
         }
+        "root" => {
+            let t = tokenize(rest, &[])?;
+            if t.help {
+                return Ok(Command::Help);
+            }
+            let mut json = false;
+            for (k, v) in t.opts {
+                match k.as_str() {
+                    "--json" => {
+                        require_no_val(&k, v)?;
+                        json = true;
+                    }
+                    _ => return Err(format!("unknown option '{k}' for 'root'")),
+                }
+            }
+            let mut pos = t.pos.into_iter();
+            let action_str = pos.next().unwrap_or_default();
+            let dirs: Vec<String> = pos.collect();
+            let action = match action_str.as_str() {
+                "list" => {
+                    if !dirs.is_empty() {
+                        return Err(format!("unexpected argument '{}' for 'root list'", dirs[0]));
+                    }
+                    RootAction::List { json }
+                }
+                "add" => {
+                    if json {
+                        return Err("--json is only valid for 'root list'".into());
+                    }
+                    if dirs.is_empty() {
+                        return Err("usage: diskledger root add <dir>...".into());
+                    }
+                    RootAction::Add { dirs }
+                }
+                "remove" => {
+                    if json {
+                        return Err("--json is only valid for 'root list'".into());
+                    }
+                    if dirs.is_empty() {
+                        return Err("usage: diskledger root remove <dir>...".into());
+                    }
+                    RootAction::Remove { dirs }
+                }
+                _ => return Err("usage: diskledger root list|add|remove [dir...]".into()),
+            };
+            Ok(Command::Root { action })
+        }
         "agent" => {
             let t = tokenize(rest, &["--interval"])?;
             if t.help {
@@ -470,7 +571,40 @@ pub fn run(raw: &[String]) -> Res<()> {
             println!("diskledger {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::Size { paths, kb, json } => return cmd_size(&paths, kb, json),
+        Command::Size { paths, children, unmonitored, min, limit, kb, json } => {
+            if children {
+                let roots = Store::open()
+                    .ok()
+                    .and_then(|st| st.config().ok())
+                    .map(|c| {
+                        c.roots
+                            .into_iter()
+                            .map(|r| normalize_path_str(&r.to_string_lossy()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let dir = store::canonical(&PathBuf::from(&paths[0]))?;
+                let opts = report::SizeChildrenOpts {
+                    min_bytes: min,
+                    limit,
+                    unmonitored_only: unmonitored,
+                };
+                let rep = report::compute_size_children(&RealSystem, &dir, &roots, &opts)?;
+                let mut out = io::stdout().lock();
+                let _ = if json {
+                    rep.render_json(&mut out)
+                } else if kb {
+                    rep.render_kb(&mut out)
+                } else {
+                    rep.render_human(&mut out)
+                };
+                for e in &rep.errors {
+                    eprintln!("diskledger: {e}");
+                }
+                return Ok(());
+            }
+            return cmd_size(&paths, kb, json);
+        }
         _ => {}
     }
 
@@ -486,6 +620,7 @@ pub fn run(raw: &[String]) -> Res<()> {
         Command::Candidates { min, policy, json } => cmd_candidates(&sys, &store, min, policy, json),
         Command::Status { json } => cmd_status(&store, json),
         Command::Doctor { json } => cmd_doctor(&store, json),
+        Command::Root { action } => cmd_root(&sys, &store, action),
         Command::Agent { action } => cmd_agent(&store, action),
         Command::Help | Command::Version | Command::Size { .. } => unreachable!(),
     }
@@ -700,11 +835,12 @@ fn cmd_candidates(sys: &dyn System, store: &Store, min: u64, policy: ScanPolicy,
 
 fn cmd_status(store: &Store, json: bool) -> Res<()> {
     let cfg = store.config()?;
-    let (free, total) = kstat::volume_space(&cfg.roots[0]).map_err(|e| e.to_string())?;
+    let vi = kstat::volume_info(&cfg.roots[0]).map_err(|e| e.to_string())?;
     let snaps = store.list();
     let latest = store.latest();
     let flagged = latest.as_ref().map_or(0, |s| s.rows.values().filter(|r| r.flagged).count());
     let cps = store.checkpoints();
+    let other_vols = vi.other_volumes_used();
     if json {
         let roots: Vec<String> = cfg
             .roots
@@ -721,10 +857,16 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
             })
             .collect();
         let cpj: Vec<String> = cps.iter().map(|(n, ts)| format!("{{\"name\":{},\"ts\":{}}}", json_str(n), ts)).collect();
+        let apfs_snaps: Vec<String> = vi.snapshots.iter().map(|s| json_str(s)).collect();
+        let opt_u64 = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
         println!(
-            "{{\"free\":{},\"total\":{},\"snapshots\":{},\"latest_ts\":{},\"flagged_dirs\":{},\"roots\":[{}],\"checkpoints\":[{}]}}",
-            free,
-            total,
+            "{{\"free\":{},\"total\":{},\"purgeable\":{},\"volume_used\":{},\"other_volumes_used\":{},\"apfs_snapshots\":[{}],\"snapshots\":{},\"latest_ts\":{},\"flagged_dirs\":{},\"roots\":[{}],\"checkpoints\":[{}]}}",
+            vi.free,
+            vi.total,
+            opt_u64(vi.purgeable),
+            opt_u64(vi.volume_used),
+            opt_u64(other_vols),
+            apfs_snaps.join(","),
             snaps.len(),
             latest.as_ref().map_or(0, |s| s.ts),
             flagged,
@@ -733,12 +875,36 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
         );
         return Ok(());
     }
+    let mut extra = Vec::new();
+    if let Some(p) = vi.purgeable {
+        if p > 0 {
+            extra.push(format!("+{} purgeable", human(p)));
+        }
+    }
+    if let Some(ov) = other_vols {
+        if ov > 0 {
+            extra.push(format!("{} in other container volumes", human(ov)));
+        }
+    }
+    let extra_str = if extra.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", extra.join(", "))
+    };
     println!(
-        "Free space: {} of {} ({:.0}% used)",
-        human(free),
-        human(total),
-        100.0 * (1.0 - free as f64 / total.max(1) as f64)
+        "Free space: {} of {} ({:.0}% used{})",
+        human(vi.free),
+        human(vi.total),
+        100.0 * (1.0 - vi.free as f64 / vi.total.max(1) as f64),
+        extra_str
     );
+    if !vi.snapshots.is_empty() {
+        println!(
+            "Local APFS snapshots: {} ({})",
+            vi.snapshots.len(),
+            vi.snapshots.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     println!("State: {}", store.home.display());
     match &latest {
         Some(s) => println!(
@@ -774,6 +940,121 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Add validated APFS directories to the configured roots (never flags).
+pub fn add_roots_with(sys: &dyn System, store: &Store, paths: &[PathBuf]) -> Res<Vec<String>> {
+    if paths.is_empty() {
+        return Err("usage: diskledger root add <dir>...".into());
+    }
+    let mut cfg = store.config()?;
+    let mut added = Vec::with_capacity(paths.len());
+    for p in paths {
+        let key = normalize_path_str(&p.to_string_lossy());
+        match sys.dir_dev(p) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("{key}: not a directory")),
+            Err(e) => return Err(format!("{key}: {e}")),
+        }
+        sys.query(p).map_err(|e| {
+            format!("{key}: kernel dir-stats unavailable ({e}). Is this an APFS volume?")
+        })?;
+        cfg.roots.push(PathBuf::from(&key));
+        added.push(key);
+    }
+    cfg.validate()?;
+    store.write_config(&cfg)?;
+    Ok(added)
+}
+
+/// Remove roots from the config (allows removing paths that no longer exist on disk).
+pub fn remove_roots_with(store: &Store, paths: &[String]) -> Res<Vec<String>> {
+    if paths.is_empty() {
+        return Err("usage: diskledger root remove <dir>...".into());
+    }
+    let mut cfg = store.config()?;
+    let mut removed = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let norm = normalize_path_str(raw);
+        let canon = std::fs::canonicalize(raw)
+            .ok()
+            .map(|p| normalize_path_str(&p.to_string_lossy()));
+        let idx = cfg.roots.iter().position(|r| {
+            let rk = normalize_path_str(&r.to_string_lossy());
+            rk == norm || canon.as_deref() == Some(rk.as_str())
+        });
+        let Some(i) = idx else {
+            return Err(format!("'{norm}' is not a monitored root"));
+        };
+        let gone = normalize_path_str(&cfg.roots.remove(i).to_string_lossy());
+        removed.push(gone);
+    }
+    if cfg.roots.is_empty() {
+        return Err("cannot remove the last monitored root".into());
+    }
+    cfg.validate()?;
+    store.write_config(&cfg)?;
+    Ok(removed)
+}
+
+fn cmd_root(sys: &dyn System, store: &Store, action: RootAction) -> Res<()> {
+    match action {
+        RootAction::List { json } => {
+            let cfg = store.config()?;
+            let latest = store.latest();
+            if json {
+                let items: Vec<String> = cfg
+                    .roots
+                    .iter()
+                    .map(|r| {
+                        let k = r.to_string_lossy();
+                        let row = latest.as_ref().and_then(|s| s.rows.get(k.as_ref()));
+                        format!(
+                            "{{\"path\":{},\"bytes\":{},\"flagged\":{}}}",
+                            json_str(&k),
+                            row.map_or(0, |r| r.bytes),
+                            row.map_or(false, |r| r.flagged)
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+                return Ok(());
+            }
+            for r in &cfg.roots {
+                let k = r.to_string_lossy();
+                match latest.as_ref().and_then(|s| s.rows.get(k.as_ref())) {
+                    Some(row) => println!(
+                        "{:>9}  {}{}",
+                        human(row.bytes),
+                        k,
+                        if row.flagged { " *" } else { "  (not flagged)" }
+                    ),
+                    None => println!("{:>9}  {}  (not scanned yet)", "?", k),
+                }
+            }
+            Ok(())
+        }
+        RootAction::Add { dirs } => {
+            let mut canon = Vec::with_capacity(dirs.len());
+            for d in &dirs {
+                canon.push(store::canonical(&PathBuf::from(d))?);
+            }
+            let added = add_roots_with(sys, store, &canon)?;
+            for p in &added {
+                println!("Added root {p}");
+            }
+            println!("Nothing has been flagged yet. Preview with: diskledger scan --dry-run");
+            Ok(())
+        }
+        RootAction::Remove { dirs } => {
+            let removed = remove_roots_with(store, &dirs)?;
+            for p in &removed {
+                println!("Removed root {p}");
+            }
+            println!("Existing snapshots keep their history; future diffs will list removed roots as no longer monitored.");
+            Ok(())
+        }
+    }
 }
 
 fn cmd_doctor(store: &Store, json: bool) -> Res<()> {

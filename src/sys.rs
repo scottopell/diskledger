@@ -1,7 +1,7 @@
 //! External OS/APFS/clock boundary so scanning and state transitions can run
 //! deterministically against an in-memory simulator as well as real macOS APFS.
 
-use crate::kstat::{self, DirStat};
+use crate::kstat::{self, DirStat, VolumeInfo};
 use crate::util;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
@@ -9,6 +9,16 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectEntry {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub dev: u64,
+    /// Allocated bytes (`blocks * 512`) for non-directory entries; 0 for directories.
+    pub file_bytes: u64,
+}
 
 #[derive(Debug, Default)]
 pub struct DirListing {
@@ -27,6 +37,10 @@ pub trait System: Send + Sync {
     fn query(&self, path: &Path) -> io::Result<DirStat>;
     fn flag(&self, path: &Path) -> io::Result<()>;
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)>;
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        let (free, total) = self.volume_space(path)?;
+        Ok(VolumeInfo { free, total, ..Default::default() })
+    }
     /// If `path` is a directory (following symlinks at the root), return `Ok(Some(dev))`.
     /// If it exists and is not a directory, return `Ok(None)`.
     fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>>;
@@ -34,6 +48,8 @@ pub trait System: Send + Sync {
     fn symlink_dev(&self, path: &Path) -> io::Result<u64>;
     /// List immediate non-symlink subdirectories (up to `max_children`) and detect direct `.git`.
     fn list_dir(&self, path: &Path, max_children: usize) -> io::Result<DirListing>;
+    /// List immediate entries (directories, files, symlinks) with device ID and non-dir allocated bytes.
+    fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>>;
     /// True when `path/.git` exists (file or directory).
     fn has_git(&self, path: &Path) -> bool;
     /// Current Unix timestamp in seconds.
@@ -53,6 +69,10 @@ impl System for RealSystem {
 
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)> {
         kstat::volume_space(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        kstat::volume_info(path)
     }
 
     fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {
@@ -131,6 +151,70 @@ impl System for RealSystem {
                     return Ok(out);
                 }
             }
+        }
+        Ok(out)
+    }
+
+    fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>> {
+        struct DirGuard(*mut libc::DIR);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                unsafe { libc::closedir(self.0) };
+            }
+        }
+
+        let c = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let raw = unsafe { libc::opendir(c.as_ptr()) };
+        if raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let _guard = DirGuard(raw);
+        let dirfd = unsafe { libc::dirfd(raw) };
+        let mut out = Vec::new();
+
+        loop {
+            let ent = unsafe { libc::readdir(raw) };
+            if ent.is_null() {
+                break;
+            }
+            let (name_ptr, name_bytes) = unsafe {
+                let d = &*ent;
+                let ptr = d.d_name.as_ptr();
+                (ptr, CStr::from_ptr(ptr).to_bytes())
+            };
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let child_path = path.join(OsStr::from_bytes(name_bytes));
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let rc = if dirfd >= 0 {
+                unsafe { libc::fstatat(dirfd, name_ptr, &mut st, libc::AT_SYMLINK_NOFOLLOW) }
+            } else {
+                let cc = match CString::new(child_path.as_os_str().as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                unsafe { libc::lstat(cc.as_ptr(), &mut st) }
+            };
+            if rc != 0 {
+                continue;
+            }
+            let mode = st.st_mode & libc::S_IFMT;
+            let is_dir = mode == libc::S_IFDIR;
+            let is_symlink = mode == libc::S_IFLNK;
+            let file_bytes = if is_dir {
+                0
+            } else {
+                (st.st_blocks.max(0) as u64).saturating_mul(512)
+            };
+            out.push(DirectEntry {
+                path: child_path,
+                is_dir,
+                is_symlink,
+                dev: st.st_dev as u64,
+                file_bytes,
+            });
         }
         Ok(out)
     }

@@ -91,6 +91,12 @@ pub struct Snapshot {
     pub ts: u64,
     pub free: u64,
     pub total: u64,
+    /// APFS purgeable bytes macOS can reclaim on demand.
+    pub purgeable: Option<u64>,
+    /// Bytes used by this APFS volume alone (`ATTR_VOL_SPACEUSED`).
+    pub volume_used: Option<u64>,
+    /// Number of local APFS snapshots on this volume at scan time.
+    pub apfs_snapshots: Option<u64>,
     /// Configured roots at scan time (empty when loaded from legacy v0.1.2 snapshots).
     pub roots: Vec<String>,
     /// True when all configured roots live on the same volume.
@@ -108,6 +114,9 @@ impl Default for Snapshot {
             ts: 0,
             free: 0,
             total: 0,
+            purgeable: None,
+            volume_used: None,
+            apfs_snapshots: None,
             roots: Vec::new(),
             single_volume: true,
             extra_git_repos: BTreeSet::new(),
@@ -118,6 +127,12 @@ impl Default for Snapshot {
 }
 
 impl Snapshot {
+    /// Bytes used by sibling volumes in the same APFS container (e.g. VM swap, System).
+    pub fn other_volumes_used(&self) -> Option<u64> {
+        let vu = self.volume_used?;
+        Some(self.total.saturating_sub(self.free).saturating_sub(vu))
+    }
+
     /// Rows at `path` and beneath it.
     pub fn subtree<'a>(&'a self, path: &'a str) -> impl Iterator<Item = (&'a String, &'a Row)> + 'a {
         self.rows
@@ -224,12 +239,22 @@ impl Store {
     pub fn save(&self, s: &Snapshot) -> Res<()> {
         self.ensure_dirs()?;
         let mut out = format!(
-            "#diskledger v1\tts={}\tfree={}\ttotal={}\tsingle_volume={}\n",
+            "#diskledger v1\tts={}\tfree={}\ttotal={}\tsingle_volume={}",
             s.ts,
             s.free,
             s.total,
             if s.single_volume { 1 } else { 0 }
         );
+        if let Some(p) = s.purgeable {
+            out.push_str(&format!("\tpurgeable={p}"));
+        }
+        if let Some(vu) = s.volume_used {
+            out.push_str(&format!("\tvol_used={vu}"));
+        }
+        if let Some(sn) = s.apfs_snapshots {
+            out.push_str(&format!("\tapfs_snaps={sn}"));
+        }
+        out.push('\n');
         if !s.roots.is_empty() {
             out.push_str("#roots");
             for r in &s.roots {
@@ -282,6 +307,12 @@ impl Store {
                                 "0" => false,
                                 _ => return Err(format!("corrupt snapshot {ts} line {lineno}: bad single_volume '{v}'")),
                             };
+                        } else if let Some(v) = f.strip_prefix("purgeable=") {
+                            s.purgeable = Some(v.parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad purgeable '{v}'"))?);
+                        } else if let Some(v) = f.strip_prefix("vol_used=") {
+                            s.volume_used = Some(v.parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad vol_used '{v}'"))?);
+                        } else if let Some(v) = f.strip_prefix("apfs_snaps=") {
+                            s.apfs_snapshots = Some(v.parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad apfs_snaps '{v}'"))?);
                         }
                     }
                 }

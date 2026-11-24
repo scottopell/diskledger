@@ -2,12 +2,17 @@
 //! scan, store, prune, checkpoint, diff, top, and candidates logic against an
 //! in-memory APFS filesystem simulator (`FakeFs`) and virtual clock.
 
-use diskledger::cli::{current_with, fresh_scan_with, resolve_since_at, ScanPolicy};
-use diskledger::kstat::DirStat;
-use diskledger::report::{compute_candidates, compute_diff, compute_top, DiffStatus};
+use diskledger::cli::{
+    add_roots_with, current_with, fresh_scan_with, remove_roots_with, resolve_since_at, ScanPolicy,
+};
+use diskledger::kstat::{DirStat, VolumeInfo};
+use diskledger::report::{
+    compute_candidates, compute_diff, compute_size_children, compute_top, DiffStatus,
+    MonitoredState, SizeChildrenOpts,
+};
 use diskledger::scan::{self, ScanOpts};
 use diskledger::store::{Config, Snapshot, Store};
-use diskledger::sys::{DirListing, System};
+use diskledger::sys::{DirListing, DirectEntry, System};
 use diskledger::util::{is_same_or_under, is_under, normalize_path_str, parent_of};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -77,6 +82,9 @@ struct FakeState {
 struct FakeFs {
     state: Mutex<FakeState>,
     outside_used: AtomicU64,
+    other_volumes_used: AtomicU64,
+    purgeable: AtomicU64,
+    apfs_snapshots: AtomicU64,
     volume_total: u64,
     clock: AtomicU64,
     ops: Mutex<OpCounts>,
@@ -93,6 +101,9 @@ impl FakeFs {
                 symlinks: BTreeMap::new(),
             }),
             outside_used: AtomicU64::new(10 << 30),
+            other_volumes_used: AtomicU64::new(5 << 30),
+            purgeable: AtomicU64::new(1 << 30),
+            apfs_snapshots: AtomicU64::new(0),
             volume_total: 200 << 30,
             clock: AtomicU64::new(start_ts),
             ops: Mutex::new(OpCounts::default()),
@@ -202,6 +213,32 @@ impl FakeFs {
         self.outside_used.store(next, Ordering::Relaxed);
     }
 
+    fn adjust_apfs_container(&self, other_vol_delta: i64, purgeable_delta: i64, snap_delta: i8) {
+        let ov = self.other_volumes_used.load(Ordering::Relaxed);
+        let next_ov = if other_vol_delta >= 0 {
+            ov.saturating_add(other_vol_delta as u64).min(40 << 30)
+        } else {
+            ov.saturating_sub(other_vol_delta.unsigned_abs())
+        };
+        self.other_volumes_used.store(next_ov, Ordering::Relaxed);
+
+        let pu = self.purgeable.load(Ordering::Relaxed);
+        let next_pu = if purgeable_delta >= 0 {
+            pu.saturating_add(purgeable_delta as u64).min(20 << 30)
+        } else {
+            pu.saturating_sub(purgeable_delta.unsigned_abs())
+        };
+        self.purgeable.store(next_pu, Ordering::Relaxed);
+
+        let sn = self.apfs_snapshots.load(Ordering::Relaxed);
+        let next_sn = if snap_delta >= 0 {
+            sn.saturating_add(snap_delta as u64).min(10)
+        } else {
+            sn.saturating_sub(snap_delta.unsigned_abs() as u64)
+        };
+        self.apfs_snapshots.store(next_sn, Ordering::Relaxed);
+    }
+
     /// Ground-truth same-volume stats for `path`, matching APFS semantics.
     fn ground_truth_stats(&self, path: &str) -> Option<DirStat> {
         let p = normalize_path_str(path);
@@ -281,6 +318,11 @@ impl FakeFs {
             .sum();
         file_sum.saturating_add(self.outside_used.load(Ordering::Relaxed))
     }
+
+    fn vol1_container_used(&self) -> u64 {
+        self.vol1_used()
+            .saturating_add(self.other_volumes_used.load(Ordering::Relaxed))
+    }
 }
 
 impl System for FakeFs {
@@ -325,10 +367,45 @@ impl System for FakeFs {
             .map(|d| d.dev)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))?;
         if dev == 1 {
-            let used = self.vol1_used();
+            let used = self.vol1_container_used();
             Ok((self.volume_total.saturating_sub(used), self.volume_total))
         } else {
             Ok((50 << 30, 100 << 30))
+        }
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        let p = normalize_path_str(&path.to_string_lossy());
+        self.ops.lock().unwrap().volume_space += 1;
+        let dev = self
+            .state
+            .lock()
+            .unwrap()
+            .dirs
+            .get(&p)
+            .map(|d| d.dev)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))?;
+        if dev == 1 {
+            let vol_used = self.vol1_used();
+            let container_used = vol_used.saturating_add(self.other_volumes_used.load(Ordering::Relaxed));
+            let free = self.volume_total.saturating_sub(container_used);
+            let sn = self.apfs_snapshots.load(Ordering::Relaxed);
+            let snapshots = (0..sn).map(|i| format!("com.apple.TimeMachine.snap-{i}")).collect();
+            Ok(VolumeInfo {
+                free,
+                total: self.volume_total,
+                purgeable: Some(self.purgeable.load(Ordering::Relaxed)),
+                volume_used: Some(vol_used),
+                snapshots,
+            })
+        } else {
+            Ok(VolumeInfo {
+                free: 50 << 30,
+                total: 100 << 30,
+                purgeable: Some(0),
+                volume_used: Some(50 << 30),
+                snapshots: Vec::new(),
+            })
         }
     }
 
@@ -390,6 +467,55 @@ impl System for FakeFs {
             }
         }
         Ok(DirListing { subdirs, too_many_children: false, has_git, has_direct_files })
+    }
+
+    fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>> {
+        let p = normalize_path_str(&path.to_string_lossy());
+        self.ops.lock().unwrap().list_dirs += 1;
+        let st = self.state.lock().unwrap();
+        let d = st
+            .dirs
+            .get(&p)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such directory"))?;
+        if d.unreadable {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"));
+        }
+        let parent_dev = d.dev;
+        let mut out = Vec::new();
+        for (k, info) in &st.dirs {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: true,
+                    is_symlink: false,
+                    dev: info.dev,
+                    file_bytes: 0,
+                });
+            }
+        }
+        for (k, &bytes) in &st.files {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: false,
+                    is_symlink: false,
+                    dev: parent_dev,
+                    file_bytes: bytes,
+                });
+            }
+        }
+        for k in st.symlinks.keys() {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: false,
+                    is_symlink: true,
+                    dev: parent_dev,
+                    file_bytes: 0,
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn has_git(&self, path: &Path) -> bool {
@@ -455,6 +581,7 @@ enum Transition {
     AddSymlinkCycle { parent_idx: usize, target_idx: usize },
     AddCrossDevMount { parent_idx: usize, bytes: u64 },
     OutsideVolumeDelta { delta: i64 },
+    ApfsContainerShift { other_vol_delta: i64, purgeable_delta: i64, snap_delta: i8 },
     AdvanceTime { dt: u64 },
     AddRoot { same_volume: bool },
     RemoveRoot { root_idx: usize },
@@ -496,6 +623,10 @@ fn transition_strategy() -> impl Strategy<Value = Transition> {
             .prop_map(|(parent_idx, bytes)| Transition::AddCrossDevMount { parent_idx, bytes }),
         2 => (-(4i64 << 20)..=(4i64 << 20))
             .prop_map(|delta| Transition::OutsideVolumeDelta { delta }),
+        1 => (-(200i64 << 20)..=(200i64 << 20), -(200i64 << 20)..=(200i64 << 20), -1i8..=2i8)
+            .prop_map(|(other_vol_delta, purgeable_delta, snap_delta)| {
+                Transition::ApfsContainerShift { other_vol_delta, purgeable_delta, snap_delta }
+            }),
         2 => prop_oneof![
             Just(0u64),
             1u64..3600,
@@ -739,6 +870,9 @@ proptest! {
                 Transition::OutsideVolumeDelta { delta } => {
                     fs.adjust_outside(delta);
                 }
+                Transition::ApfsContainerShift { other_vol_delta, purgeable_delta, snap_delta } => {
+                    fs.adjust_apfs_container(other_vol_delta, purgeable_delta, snap_delta);
+                }
                 Transition::AdvanceTime { dt } => {
                     fs.advance_time(dt);
                 }
@@ -928,7 +1062,7 @@ proptest! {
                         let base = store.load(base_ts).expect("load base snapshot");
                         let diff = compute_diff(&base, &cur, min);
 
-                        // Accounting conservation.
+                        // Accounting conservation (both 2-way and 3-way APFS container breakdown).
                         if base.single_volume && cur.single_volume {
                             let out = diff.outside_delta.expect("single_volume diff must have outside_delta");
                             prop_assert_eq!(
@@ -936,12 +1070,24 @@ proptest! {
                                 -diff.free_delta,
                                 "accounting conservation violated"
                             );
+                            if let (Some(unmon), Some(other)) =
+                                (diff.unmonitored_volume_delta, diff.other_volumes_delta)
+                            {
+                                prop_assert_eq!(
+                                    diff.monitored_delta + unmon + other,
+                                    -diff.free_delta,
+                                    "3-way APFS container conservation violated"
+                                );
+                                prop_assert_eq!(unmon + other, out);
+                            }
                         } else {
                             prop_assert_eq!(
                                 diff.outside_delta,
                                 None,
                                 "multi-volume diff must omit outside_delta"
                             );
+                            prop_assert_eq!(diff.unmonitored_volume_delta, None);
+                            prop_assert_eq!(diff.other_volumes_delta, None);
                         }
 
                         // Exact ground-truth monitored_delta over roots present in BOTH configs.
@@ -1447,5 +1593,179 @@ proptest! {
         let fresh = current_with(&fs, &store, ScanPolicy::MaxAge(max_age), true).unwrap();
         prop_assert!(fs.ops_total() > ops_before2, "--max-age miss must run a fresh scan");
         prop_assert!(fresh.ts > s1.ts);
+    }
+
+    /// `size --children` / `--unmonitored` invariants:
+    /// - Strictly sorted descending by shown bytes
+    /// - Monitored roots are skipped with ZERO walks under `--unmonitored`
+    /// - Partial parents (like `~/Library` containing `~/Library/Caches`) subtract
+    ///   monitored descendants accurately
+    /// - `sum(entries) + omitted_bytes == total_bytes`, never crosses volumes, never calls flag()
+    #[test]
+    fn size_children_sorting_partial_subtraction_and_zero_walk_skip(
+        mon_bytes in (10u64 << 20)..(100u64 << 20),
+        partial_mon_bytes in (10u64 << 20)..(80u64 << 20),
+        partial_unmon_bytes in (5u64 << 20)..(80u64 << 20),
+        unmon_sizes in prop::collection::vec(0u64..(60u64 << 20), 1..=8),
+        file_bytes in 0u64..(20u64 << 20),
+        min_bytes in prop_oneof![Just(0u64), Just(10u64 << 20), Just(30u64 << 20)],
+        limit in prop_oneof![Just(None), (1usize..=5).prop_map(Some)],
+    ) {
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/home", 1);
+        // 1. Fully monitored root (intentionally unflagged so any query would increment walks!)
+        fs.mkdir("/home/dev", 1);
+        fs.write_file("/home/dev/blob.bin", mon_bytes);
+        // 2. Partial parent: /home/Library has monitored /home/Library/Caches + unmonitored AppSupport
+        fs.mkdir("/home/Library", 1);
+        fs.mkdir("/home/Library/Caches", 1);
+        fs.write_file("/home/Library/Caches/c.bin", partial_mon_bytes);
+        fs.flag(Path::new("/home/Library/Caches")).unwrap();
+        fs.mkdir("/home/Library/AppSupport", 1);
+        fs.write_file("/home/Library/AppSupport/a.bin", partial_unmon_bytes);
+        // 3. Pure unmonitored sibling dirs
+        for (i, &sz) in unmon_sizes.iter().enumerate() {
+            let d = format!("/home/unmon_{i}");
+            fs.mkdir(&d, 1);
+            fs.write_file(&format!("{d}/f.bin"), sz);
+        }
+        // 4. Direct file + cross-dev mount (must be ignored)
+        fs.write_file("/home/direct.bin", file_bytes);
+        fs.mkdir("/home/external_vol", 2);
+        fs.write_file("/home/external_vol/huge.bin", 999 << 20);
+
+        let roots = vec!["/home/dev".to_string(), "/home/Library/Caches".to_string()];
+
+        // Full children mode
+        let ops0 = fs.ops_snapshot();
+        let all = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes, limit, unmonitored_only: false },
+        )
+        .unwrap();
+        let ops1 = fs.ops_snapshot();
+        prop_assert_eq!(ops1.flags, ops0.flags, "size -c must never flag");
+        prop_assert!(
+            all.entries.iter().all(|e| e.path != "/home/external_vol"),
+            "size -c must not cross volumes"
+        );
+        let kept_sum: u64 = all.entries.iter().map(|e| e.bytes).sum();
+        prop_assert_eq!(kept_sum + all.omitted_bytes, all.total_bytes);
+        for w in all.entries.windows(2) {
+            prop_assert!(w[0].bytes >= w[1].bytes, "not sorted descending");
+        }
+        let mut jbuf = Vec::new();
+        all.render_json(&mut jbuf).unwrap();
+        assert_json_valid(&jbuf, "size -c json");
+        let mut hbuf = Vec::new();
+        all.render_human(&mut hbuf).unwrap();
+
+        // Unmonitored-only mode: MUST skip /home/dev without walking it, and report
+        // exact unmonitored_bytes for /home/Library!
+        let unmon_all = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes: 0, limit: None, unmonitored_only: true },
+        )
+        .unwrap();
+        prop_assert!(unmon_all.entries.iter().all(|e| e.path != "/home/dev"));
+        let lib = unmon_all
+            .entries
+            .iter()
+            .find(|e| e.path == "/home/Library")
+            .expect("/home/Library must appear");
+        prop_assert_eq!(lib.monitored, MonitoredState::Partial);
+        prop_assert_eq!(lib.bytes, partial_mon_bytes + partial_unmon_bytes);
+        prop_assert_eq!(lib.unmonitored_bytes, partial_unmon_bytes);
+
+        let expected_unmon_total: u64 =
+            partial_unmon_bytes + unmon_sizes.iter().sum::<u64>() + file_bytes;
+        prop_assert_eq!(unmon_all.total_bytes, expected_unmon_total);
+
+        // Verify covered dir `/home/dev` is skipped with 0 walks when every other dir is flagged.
+        fs.flag(Path::new("/home/Library")).unwrap();
+        for i in 0..unmon_sizes.len() {
+            fs.flag(Path::new(&format!("/home/unmon_{i}"))).unwrap();
+        }
+        let pre = fs.ops_snapshot();
+        let _ = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes, limit, unmonitored_only: true },
+        )
+        .unwrap();
+        let post = fs.ops_snapshot();
+        prop_assert_eq!(
+            post.walks - pre.walks,
+            0,
+            "size -c -u must not walk covered root /home/dev"
+        );
+    }
+
+    /// `root add` / `root remove` invariants:
+    /// - Adding valid disjoint roots persists atomically and never calls `flag()`
+    /// - Adding duplicates, nested overlaps, or non-directories fails leaving config untouched
+    /// - Removing existing or even already-deleted roots works cleanly; removing the last root fails
+    #[test]
+    fn root_add_remove_invariants(
+        extra_names in prop::collection::btree_set("[a-z]{2,8}", 2..=5),
+        delete_before_remove in any::<bool>(),
+    ) {
+        let home = TempHome::new("roots");
+        let store = Store::open_at(home.0.clone());
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/vol", 1);
+        fs.mkdir("/vol/base", 1);
+        let init_cfg = Config {
+            roots: vec![PathBuf::from("/vol/base")],
+            ..Config::default()
+        };
+        store.write_config(&init_cfg).unwrap();
+
+        let paths: Vec<PathBuf> = extra_names
+            .iter()
+            .map(|n| {
+                let p = format!("/vol/{n}");
+                fs.mkdir(&p, 1);
+                PathBuf::from(p)
+            })
+            .collect();
+
+        let ops0 = fs.ops_snapshot();
+        let added = add_roots_with(&fs, &store, &paths).unwrap();
+        let ops1 = fs.ops_snapshot();
+        prop_assert_eq!(ops1.flags, ops0.flags, "root add must NEVER flag");
+        prop_assert_eq!(added.len(), paths.len());
+
+        // Duplicate root rejected without mutating config.
+        let before_dup = store.config().unwrap();
+        prop_assert!(add_roots_with(&fs, &store, &[paths[0].clone()]).is_err());
+        prop_assert_eq!(&store.config().unwrap(), &before_dup);
+
+        // Overlapping nested child rejected without mutating config.
+        let nested = PathBuf::from(format!("{}/child", paths[0].display()));
+        fs.mkdir(&nested.to_string_lossy(), 1);
+        prop_assert!(add_roots_with(&fs, &store, &[nested]).is_err());
+        prop_assert_eq!(&store.config().unwrap(), &before_dup);
+
+        // Removing all added roots succeeds even if one was already deleted from disk.
+        if delete_before_remove {
+            fs.delete_dir_tree(&paths[0].to_string_lossy());
+        }
+        let rm_args: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let removed = remove_roots_with(&store, &rm_args).unwrap();
+        prop_assert_eq!(removed.len(), paths.len());
+        prop_assert_eq!(store.config().unwrap().roots, vec![PathBuf::from("/vol/base")]);
+
+        // Removing the last remaining root must error and preserve config.
+        prop_assert!(remove_roots_with(&store, &["/vol/base".to_string()]).is_err());
+        prop_assert_eq!(store.config().unwrap().roots, vec![PathBuf::from("/vol/base")]);
     }
 }

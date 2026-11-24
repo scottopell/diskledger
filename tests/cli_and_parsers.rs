@@ -1,7 +1,7 @@
 //! Property tests for typed CLI parsing, encoding/parsing primitives,
 //! `apfs.util -S` output parsing, config validation, and snapshot corruption checks.
 
-use diskledger::cli::{parse_args, AgentAction, Command, ScanPolicy};
+use diskledger::cli::{parse_args, AgentAction, Command, RootAction, ScanPolicy};
 use diskledger::kstat::{parse_apfs_util_s, DirStat};
 use diskledger::store::{Config, Row, Snapshot, Store};
 use diskledger::util::{
@@ -151,7 +151,7 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
             argv.push(name.clone());
             (Command::Checkpoint { name, policy }, argv)
         }),
-        // size
+        // size (direct paths)
         (prop::collection::vec(safe_path(), 1..=4), any::<bool>(), any::<bool>(), any::<bool>())
             .prop_map(|(paths, kb, short_k, json)| {
                 let mut argv = vec!["size".to_string()];
@@ -165,7 +165,64 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                     argv.push("--".into());
                 }
                 argv.extend(paths.clone());
-                (Command::Size { paths, kb, json }, argv)
+                (
+                    Command::Size {
+                        paths,
+                        children: false,
+                        unmonitored: false,
+                        min: 0,
+                        limit: None,
+                        kb,
+                        json,
+                    },
+                    argv,
+                )
+            }),
+        // size --children
+        (
+            safe_path(),
+            any::<bool>(),
+            any::<bool>(),
+            any::<bool>(),
+            proptest::option::of(size_arg_strategy()),
+            proptest::option::of(1usize..50),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(path, short_c, unmon, short_u, min_opt, limit, json, eq_style)| {
+                let mut argv = vec!["size".to_string()];
+                argv.push(if short_c { "-c" } else { "--children" }.into());
+                if unmon {
+                    argv.push(if short_u { "-u" } else { "--unmonitored" }.into());
+                }
+                let min = if let Some((s, bytes)) = min_opt {
+                    push_opt(&mut argv, "--min", &s, eq_style);
+                    bytes
+                } else {
+                    0
+                };
+                if let Some(lim) = limit {
+                    push_opt(&mut argv, "--limit", &lim.to_string(), eq_style);
+                }
+                if json {
+                    argv.push("--json".into());
+                }
+                if path.starts_with('-') {
+                    argv.push("--".into());
+                }
+                argv.push(path.clone());
+                (
+                    Command::Size {
+                        paths: vec![path],
+                        children: true,
+                        unmonitored: unmon,
+                        min,
+                        limit,
+                        kb: false,
+                        json,
+                    },
+                    argv,
+                )
             }),
         // top
         (
@@ -234,6 +291,34 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
             }
             (Command::Doctor { json }, argv)
         }),
+        // root
+        prop_oneof![
+            any::<bool>().prop_map(|json| {
+                let mut argv = vec!["root".to_string(), "list".to_string()];
+                if json {
+                    argv.push("--json".into());
+                }
+                (Command::Root { action: RootAction::List { json } }, argv)
+            }),
+            (prop::collection::vec(safe_path(), 1..=3), any::<bool>()).prop_map(
+                |(dirs, is_add)| {
+                    let mut argv = vec![
+                        "root".to_string(),
+                        if is_add { "add" } else { "remove" }.to_string(),
+                    ];
+                    if dirs.iter().any(|d| d.starts_with('-')) {
+                        argv.push("--".into());
+                    }
+                    argv.extend(dirs.clone());
+                    let action = if is_add {
+                        RootAction::Add { dirs }
+                    } else {
+                        RootAction::Remove { dirs }
+                    };
+                    (Command::Root { action }, argv)
+                }
+            ),
+        ],
         // agent
         prop_oneof![
             (proptest::option::of(60u64..86400), any::<bool>(), any::<bool>()).prop_map(
@@ -304,6 +389,21 @@ proptest! {
         mins in 1u64..60,
     ) {
         let argv = vec![sub.to_string(), "--no-scan".into(), "--max-age".into(), format!("{mins}m")];
+        prop_assert!(parse_args(&argv).is_err());
+    }
+
+    #[test]
+    fn cli_size_children_only_flags_require_children(
+        flag in prop_oneof![
+            Just(vec!["-u"]),
+            Just(vec!["--unmonitored"]),
+            Just(vec!["--min", "10M"]),
+            Just(vec!["--limit", "10"]),
+        ],
+    ) {
+        let mut argv = vec!["size".to_string()];
+        argv.extend(flag.into_iter().map(str::to_string));
+        argv.push("/tmp".into());
         prop_assert!(parse_args(&argv).is_err());
     }
 
