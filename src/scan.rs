@@ -12,10 +12,10 @@
 //!   unflagged siblings are skipped without walking them.
 
 use crate::kstat::{self, DirStat};
-use crate::report::REGENERABLE;
-use crate::store::{Config, Row, Snapshot};
+use crate::report;
+use crate::store::{Config, GitKind, Row, Snapshot};
 use crate::sys::System;
-use crate::util::{base_name, is_under, normalize_path_str, parent_of};
+use crate::util::{is_under, normalize_path_str, parent_of};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -114,6 +114,7 @@ struct ChildTask {
     path: PathBuf,
     key: String,
     prefetched: Option<DirStat>,
+    mtime: Option<u64>,
     /// True when bytes/entries/covered were already added to the parent budget in Pass 1.
     already_accounted: bool,
 }
@@ -134,7 +135,7 @@ struct ChildBatch {
 }
 
 struct RootBatch<'a> {
-    roots: Vec<(&'a Path, u64)>,
+    roots: Vec<(&'a Path, u64, u64)>,
     next_idx: AtomicUsize,
     remaining_workers: AtomicUsize,
 }
@@ -238,8 +239,8 @@ impl<'a> Pool<'a> {
                     if i >= batch.roots.len() {
                         break;
                     }
-                    let (root, dev) = batch.roots[i];
-                    cx.visit(root, 0, dev, false, None, Some(self));
+                    let (root, dev, mtime) = batch.roots[i];
+                    cx.visit(root, 0, dev, mtime, false, None, Some(self));
                 }
                 self.finish_worker(&batch.remaining_workers);
             }
@@ -267,18 +268,23 @@ impl<'a> Pool<'a> {
                             continue;
                         }
                     }
-                    // For prefetched children, symlink_dev was already verified in Pass 1.
-                    let same_dev = task.prefetched.is_some()
-                        || cx.sys.symlink_dev(&task.path).map(|d| d == batch.dev).unwrap_or(false);
-                    if !same_dev {
-                        batch.visited[i].store(true, Ordering::Relaxed);
-                        continue;
-                    }
+                    // For prefetched children, symlink_meta was already verified.
+                    let mtime = match task.mtime {
+                        Some(mt) => mt,
+                        None => match cx.sys.symlink_meta(&task.path) {
+                            Ok(m) if m.dev == batch.dev => m.mtime,
+                            _ => {
+                                batch.visited[i].store(true, Ordering::Relaxed);
+                                continue;
+                            }
+                        },
+                    };
                     batch.visited[i].store(true, Ordering::Relaxed);
                     let res = cx.visit(
                         &task.path,
                         batch.parent_depth + 1,
                         batch.dev,
+                        mtime,
                         batch.child_needs_covered,
                         task.prefetched,
                         Some(self),
@@ -299,7 +305,7 @@ impl<'a> Pool<'a> {
                     }
                     if batch.is_regen {
                         let has_row = cx.out.lock().unwrap().rows.contains_key(&task.key);
-                        if !has_row && cx.sys.has_git(&task.path) {
+                        if !has_row && cx.sys.git_kind(&task.path).is_git() {
                             cx.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                         }
                     }
@@ -352,19 +358,19 @@ pub fn run_with_threads(
         .collect();
 
     let mut root_devs = HashSet::new();
-    let mut valid_roots: Vec<(&Path, u64)> = Vec::new();
+    let mut valid_roots: Vec<(&Path, u64, u64)> = Vec::new();
     let mut vol_info: Option<kstat::VolumeInfo> = None;
 
     for root in &cfg.roots {
-        match sys.dir_dev(root) {
-            Ok(Some(dev)) => {
-                root_devs.insert(dev);
+        match sys.dir_meta(root) {
+            Ok(Some(meta)) => {
+                root_devs.insert(meta.dev);
                 if vol_info.is_none() {
                     if let Ok(vi) = sys.volume_info(root) {
                         vol_info = Some(vi);
                     }
                 }
-                valid_roots.push((root.as_path(), dev));
+                valid_roots.push((root.as_path(), meta.dev, meta.mtime));
             }
             Ok(None) => cx.out.lock().unwrap().errors.push(format!("{}: not a directory", root.display())),
             Err(e) => cx.out.lock().unwrap().errors.push(format!("{}: {e}", root.display())),
@@ -381,8 +387,8 @@ pub fn run_with_threads(
 
     let threads = threads.max(1);
     if threads == 1 {
-        for (root, dev) in valid_roots {
-            cx.visit(root, 0, dev, false, None, None);
+        for (root, dev, mtime) in valid_roots {
+            cx.visit(root, 0, dev, mtime, false, None, None);
         }
     } else if !valid_roots.is_empty() {
         let pool = Pool::new(threads);
@@ -421,6 +427,7 @@ pub fn run_with_threads(
             single_volume: root_devs.len() <= 1,
             extra_git_repos: out.extra_git_repos,
             has_git_metadata: true,
+            has_mtime_metadata: true,
             rows: out.rows,
         },
         queried: cx.queried.load(Ordering::Relaxed),
@@ -447,6 +454,7 @@ impl<'a> SharedCtx<'a> {
         path: &Path,
         depth: u32,
         dev: u64,
+        mtime: u64,
         parent_needs_covered: bool,
         prefetched: Option<DirStat>,
         pool: Option<&Pool<'a>>,
@@ -478,6 +486,7 @@ impl<'a> SharedCtx<'a> {
                                 &key,
                                 depth,
                                 dev,
+                                mtime,
                                 listing,
                                 pool,
                             );
@@ -505,7 +514,7 @@ impl<'a> SharedCtx<'a> {
             },
         };
 
-        if prefetched.is_none() && st.has_record && self.reuse_unchanged(&key, &st, depth) {
+        if prefetched.is_none() && st.has_record && self.reuse_unchanged(&key, &st, depth, mtime) {
             return VisitRes {
                 covered: st.entries + 1,
                 bytes: st.bytes,
@@ -513,7 +522,7 @@ impl<'a> SharedCtx<'a> {
             };
         }
 
-        if st.has_record && self.try_reuse_via_frontier(&key, &st, depth, dev, pool) {
+        if st.has_record && self.try_reuse_via_frontier(&key, &st, depth, dev, mtime, pool) {
             return VisitRes {
                 covered: st.entries + 1,
                 bytes: st.bytes,
@@ -522,8 +531,8 @@ impl<'a> SharedCtx<'a> {
         }
 
         let mut covered = 0u64;
-        let mut has_git = None;
-        let is_regen = REGENERABLE.contains(&base_name(&key));
+        let mut git_kind: Option<GitKind> = None;
+        let is_regen = report::needs_direct_child_git_check(&key);
         // Children first. The kernel reuses a child's record when it walks or
         // flags the parent, so flagging bottom-up walks each file once instead
         // of once per level.
@@ -534,7 +543,7 @@ impl<'a> SharedCtx<'a> {
             };
             match listing_res {
                 Ok(listing) => {
-                    has_git = Some(listing.has_git);
+                    git_kind = Some(listing.git_kind);
                     // Order children: Tier 0 = previously flagged, Tier 1 = previously recorded,
                     // Tier 2 = unrecorded. Within each tier, largest first for faster pruning.
                     let mut children: Vec<(PathBuf, String, u8, u64)> = listing
@@ -567,9 +576,10 @@ impl<'a> SharedCtx<'a> {
                     while idx < children.len() && children[idx].2 == 0 {
                         let (ref child, ref child_key, _, _) = children[idx];
                         idx += 1;
-                        if !self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false) {
-                            continue;
-                        }
+                        let cmeta = match self.sys.symlink_meta(child) {
+                            Ok(m) if m.dev == dev => m,
+                            _ => continue,
+                        };
                         match self.sys.query(child) {
                             Ok(cst) => {
                                 self.queried.fetch_add(1, Ordering::Relaxed);
@@ -581,10 +591,10 @@ impl<'a> SharedCtx<'a> {
                                     budget.visited_bytes = budget.visited_bytes.saturating_add(cst.bytes);
                                     budget.visited_entries =
                                         budget.visited_entries.saturating_add(cst.entries + 1);
-                                    if self.reuse_unchanged(child_key, &cst, depth + 1) {
+                                    if self.reuse_unchanged(child_key, &cst, depth + 1, cmeta.mtime) {
                                         if is_regen {
                                             let has_row = self.out.lock().unwrap().rows.contains_key(child_key);
-                                            if !has_row && self.sys.has_git(child) {
+                                            if !has_row && self.sys.git_kind(child).is_git() {
                                                 self.out.lock().unwrap().extra_git_repos.insert(child_key.clone());
                                             }
                                         }
@@ -594,6 +604,7 @@ impl<'a> SharedCtx<'a> {
                                         path: child.clone(),
                                         key: child_key.clone(),
                                         prefetched: Some(cst),
+                                        mtime: Some(cmeta.mtime),
                                         already_accounted: true,
                                     });
                                 } else {
@@ -602,6 +613,7 @@ impl<'a> SharedCtx<'a> {
                                         path: child.clone(),
                                         key: child_key.clone(),
                                         prefetched: Some(cst),
+                                        mtime: Some(cmeta.mtime),
                                         already_accounted: false,
                                     });
                                 }
@@ -620,8 +632,8 @@ impl<'a> SharedCtx<'a> {
                         // All remaining Tier 1/2 children are pruned; still check direct `.git` if regen.
                         if is_regen {
                             for (child, child_key, _, _) in &children[idx..] {
-                                if self.sys.symlink_dev(child).map(|d| d == dev).unwrap_or(false)
-                                    && self.sys.has_git(child)
+                                if self.sys.symlink_meta(child).map(|m| m.dev == dev).unwrap_or(false)
+                                    && self.sys.git_kind(child).is_git()
                                 {
                                     self.out.lock().unwrap().extra_git_repos.insert(child_key.clone());
                                 }
@@ -633,6 +645,7 @@ impl<'a> SharedCtx<'a> {
                                 path: child,
                                 key: child_key,
                                 prefetched: None,
+                                mtime: None,
                                 already_accounted: false,
                             };
                             if tier == 1 {
@@ -665,8 +678,8 @@ impl<'a> SharedCtx<'a> {
                         if budget.can_prune(&st, depth, parent_needs_covered, self.cfg) {
                             if is_regen {
                                 for task in &tier2_tasks {
-                                    if self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false)
-                                        && self.sys.has_git(&task.path)
+                                    if self.sys.symlink_meta(&task.path).map(|m| m.dev == dev).unwrap_or(false)
+                                        && self.sys.git_kind(&task.path).is_git()
                                     {
                                         self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                                     }
@@ -717,7 +730,7 @@ impl<'a> SharedCtx<'a> {
         let pending = !st.has_record && (depth == 0 || uncovered >= self.cfg.flag_min_entries);
 
         if depth == 0 || pending || st.bytes >= self.cfg.record_min_bytes {
-            let has_git = has_git.unwrap_or_else(|| self.sys.has_git(path));
+            let git_kind = git_kind.unwrap_or_else(|| self.sys.git_kind(path));
             self.out.lock().unwrap().rows.insert(
                 key,
                 Row {
@@ -726,7 +739,8 @@ impl<'a> SharedCtx<'a> {
                     gen: st.gen,
                     flagged: st.has_record,
                     pending,
-                    has_git,
+                    git_kind,
+                    mtime,
                 },
             );
         }
@@ -781,10 +795,10 @@ impl<'a> SharedCtx<'a> {
             if is_regen {
                 for (i, task) in batch.tasks.iter().enumerate() {
                     if !batch.visited[i].load(Ordering::Relaxed)
-                        && self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false)
+                        && self.sys.symlink_meta(&task.path).map(|m| m.dev == dev).unwrap_or(false)
                     {
                         let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                        if !has_row && self.sys.has_git(&task.path) {
+                        if !has_row && self.sys.git_kind(&task.path).is_git() {
                             self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                         }
                     }
@@ -805,15 +819,18 @@ impl<'a> SharedCtx<'a> {
                     pruned_from = Some(idx);
                     break;
                 }
-                let same_dev = task.prefetched.is_some()
-                    || self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false);
-                if !same_dev {
-                    continue;
-                }
+                let mtime = match task.mtime {
+                    Some(mt) => mt,
+                    None => match self.sys.symlink_meta(&task.path) {
+                        Ok(m) if m.dev == dev => m.mtime,
+                        _ => continue,
+                    },
+                };
                 let res = self.visit(
                     &task.path,
                     depth + 1,
                     dev,
+                    mtime,
                     child_needs_covered,
                     task.prefetched,
                     pool,
@@ -826,7 +843,7 @@ impl<'a> SharedCtx<'a> {
                 }
                 if is_regen {
                     let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                    if !has_row && self.sys.has_git(&task.path) {
+                    if !has_row && self.sys.git_kind(&task.path).is_git() {
                         self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                     }
                 }
@@ -834,9 +851,9 @@ impl<'a> SharedCtx<'a> {
             if is_regen {
                 if let Some(start) = pruned_from {
                     for task in &tasks[start..] {
-                        if self.sys.symlink_dev(&task.path).map(|d| d == dev).unwrap_or(false) {
+                        if self.sys.symlink_meta(&task.path).map(|m| m.dev == dev).unwrap_or(false) {
                             let has_row = self.out.lock().unwrap().rows.contains_key(&task.key);
-                            if !has_row && self.sys.has_git(&task.path) {
+                            if !has_row && self.sys.git_kind(&task.path).is_git() {
                                 self.out.lock().unwrap().extra_git_repos.insert(task.key.clone());
                             }
                         }
@@ -855,20 +872,23 @@ impl<'a> SharedCtx<'a> {
         key: &str,
         depth: u32,
         dev: u64,
+        mtime: u64,
         listing: crate::sys::DirListing,
         pool: Option<&Pool<'a>>,
     ) -> VisitRes {
-        let is_regen = REGENERABLE.contains(&base_name(key));
+        let is_regen = report::needs_direct_child_git_check(key);
         let mut tasks: Vec<ChildTask> = Vec::with_capacity(listing.subdirs.len());
         for child in listing.subdirs {
-            if !self.sys.symlink_dev(&child).map(|d| d == dev).unwrap_or(false) {
-                continue;
-            }
+            let cmeta = match self.sys.symlink_meta(&child) {
+                Ok(m) if m.dev == dev => m,
+                _ => continue,
+            };
             let ck = normalize_path_str(&child.to_string_lossy());
             tasks.push(ChildTask {
                 path: child,
                 key: ck,
                 prefetched: None,
+                mtime: Some(cmeta.mtime),
                 already_accounted: false,
             });
         }
@@ -919,7 +939,8 @@ impl<'a> SharedCtx<'a> {
                         gen: 0,
                         flagged: false,
                         pending: true,
-                        has_git: listing.has_git,
+                        git_kind: listing.git_kind,
+                        mtime,
                     },
                 );
             }
@@ -936,7 +957,8 @@ impl<'a> SharedCtx<'a> {
                     gen: 0,
                     flagged: false,
                     pending,
-                    has_git: listing.has_git,
+                    git_kind: listing.git_kind,
+                    mtime,
                 },
             );
         }
@@ -951,7 +973,7 @@ impl<'a> SharedCtx<'a> {
 
     /// If the kernel's change counter says nothing beneath `key` changed since
     /// the previous snapshot, copy that snapshot's rows and skip the subtree.
-    fn reuse_unchanged(&self, key: &str, st: &kstat::DirStat, depth: u32) -> bool {
+    fn reuse_unchanged(&self, key: &str, st: &kstat::DirStat, depth: u32, mtime: u64) -> bool {
         let Some(prev) = self.prev else { return false };
         let Some(old) = prev.rows.get(key) else { return false };
         if !old.flagged || old.gen != st.gen || old.bytes != st.bytes || old.entries != st.entries {
@@ -977,7 +999,9 @@ impl<'a> SharedCtx<'a> {
         // raised record_min_bytes or lowered max_depth can never leave orphan rows.
         for (p, r) in prev.subtree(key) {
             if p.as_str() == key {
-                local_rows.push((p.clone(), r.clone()));
+                let mut updated = r.clone();
+                updated.mtime = mtime;
+                local_rows.push((p.clone(), updated));
                 depths.insert(p.as_str(), depth);
                 if r.bytes >= min && depth < self.cfg.max_depth {
                     descendable.insert(p.as_str());
@@ -1032,6 +1056,7 @@ impl<'a> SharedCtx<'a> {
         st: &DirStat,
         depth: u32,
         dev: u64,
+        mtime: u64,
         pool: Option<&Pool<'a>>,
     ) -> bool {
         let Some(prev) = self.prev else { return false };
@@ -1074,14 +1099,15 @@ impl<'a> SharedCtx<'a> {
         let mut sum_dgen: u64 = 0;
         let mut sum_dbytes: i128 = 0;
         let mut sum_dentries: i128 = 0;
-        let mut dirty: Vec<(&str, DirStat, i128, i128, u32)> = Vec::new();
-        let mut clean: Vec<(&str, DirStat, u32)> = Vec::new();
+        let mut dirty: Vec<(&str, DirStat, u64, i128, i128, u32)> = Vec::new();
+        let mut clean: Vec<(&str, DirStat, u64, u32)> = Vec::new();
 
         for &(fp, old_f, f_depth) in &frontier {
             let p = Path::new(fp);
-            if !self.sys.symlink_dev(p).map(|d| d == dev).unwrap_or(false) {
-                return false;
-            }
+            let fmeta = match self.sys.symlink_meta(p) {
+                Ok(m) if m.dev == dev => m,
+                _ => return false,
+            };
             let Ok(cst) = self.sys.query(p) else { return false };
             self.queried.fetch_add(1, Ordering::Relaxed);
             if !cst.has_record {
@@ -1104,9 +1130,9 @@ impl<'a> SharedCtx<'a> {
                 if cst.bytes < min {
                     return false;
                 }
-                dirty.push((fp, cst, db, de, f_depth));
+                dirty.push((fp, cst, fmeta.mtime, db, de, f_depth));
             } else {
-                clean.push((fp, cst, f_depth));
+                clean.push((fp, cst, fmeta.mtime, f_depth));
             }
         }
 
@@ -1134,7 +1160,8 @@ impl<'a> SharedCtx<'a> {
                         gen: st.gen,
                         flagged: true,
                         pending: false,
-                        has_git: r.has_git,
+                        git_kind: r.git_kind,
+                        mtime,
                     },
                 ));
                 depths.insert(p.as_str(), depth);
@@ -1158,7 +1185,7 @@ impl<'a> SharedCtx<'a> {
             let mut db = 0i128;
             let mut de = 0i128;
             let mut has_dirty_desc = false;
-            for &(fp, _, fdb, fde, _) in &dirty {
+            for &(fp, _, _, fdb, fde, _) in &dirty {
                 if is_under(fp, p) {
                     db += fdb;
                     de += fde;
@@ -1184,7 +1211,8 @@ impl<'a> SharedCtx<'a> {
                     gen: r.gen,
                     flagged: r.flagged,
                     pending: r.pending,
-                    has_git: r.has_git,
+                    git_kind: r.git_kind,
+                    mtime: r.mtime,
                 },
             ));
             depths.insert(p.as_str(), p_depth);
@@ -1222,19 +1250,19 @@ impl<'a> SharedCtx<'a> {
         self.reused.fetch_add(reused_n, Ordering::Relaxed);
 
         // Reuse clean frontier subtrees (or move them to `dirty` if flagging & pending inside).
-        let mut to_visit: Vec<(PathBuf, DirStat, u32)> = Vec::new();
-        for (fp, cst, f_depth) in clean {
-            if !self.reuse_unchanged(fp, &cst, f_depth) {
-                to_visit.push((PathBuf::from(fp), cst, f_depth));
+        let mut to_visit: Vec<(PathBuf, DirStat, u64, u32)> = Vec::new();
+        for (fp, cst, fmt, f_depth) in clean {
+            if !self.reuse_unchanged(fp, &cst, f_depth, fmt) {
+                to_visit.push((PathBuf::from(fp), cst, fmt, f_depth));
             }
         }
-        for (fp, cst, _, _, f_depth) in dirty {
-            to_visit.push((PathBuf::from(fp), cst, f_depth));
+        for (fp, cst, fmt, _, _, f_depth) in dirty {
+            to_visit.push((PathBuf::from(fp), cst, fmt, f_depth));
         }
 
         // Visit dirty frontier subtrees (each fans out internally via `pool`).
-        for (fp, cst, f_depth) in to_visit {
-            self.visit(&fp, f_depth, dev, false, Some(cst), pool);
+        for (fp, cst, fmt, f_depth) in to_visit {
+            self.visit(&fp, f_depth, dev, fmt, false, Some(cst), pool);
         }
 
         true

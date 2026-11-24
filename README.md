@@ -41,7 +41,7 @@ diskledger diff                # what changed since the last checkin
 | `checkpoint <name>` | Named baseline | Snapshot only |
 | `size <path>...` | Size of any path right now; `-c` sorts immediate children, `-u` focuses on unmonitored space, `-k` matches `du -sk` | No |
 | `top [dir]` | Largest directories | Snapshot only |
-| `candidates` | Directories named like build output, with how long unchanged | Snapshot only |
+| `candidates` | Regenerable build/dep/cache directories with category, git origin (`repo`/`worktree`), and idle time (`--kind`, `--older-than`, `--sort`) | Snapshot only |
 | `status` | Free space (including APFS purgeable, sibling container volumes, local snapshots), roots, snapshots, checkpoints | No |
 | `doctor` | Verify the private APFS `fsctl` ABI against `apfs.util -S` | Temp dir only |
 | `agent install` | Run `scan` every 15 minutes through launchd | Installs a LaunchAgent |
@@ -87,12 +87,16 @@ disk, or `--max-age 5m` to reuse a recent background scan when fresh enough.
   update. The struct layout in `src/kstat.rs` was read from `apfs.util` on
   macOS 26.5. Run `diskledger doctor` after a macOS update to verify `fsctl`
   still matches `apfs.util -S`.
-- `candidates` matches by directory name. It does not check whether a
-  process is using the directory or who owns it. A matched directory that
-  holds git repositories is listed under `mixed`, not as a candidate; its
-  repository-free direct children are offered instead. Repositories are
-  found among recorded directories and the matched directory's direct
-  children, so a small repository nested deeper can be missed.
+- `candidates` matches build outputs (`target`, `.build`, `DerivedData`, `dist`,
+  ...), dependency trees (`node_modules`, `.venv`, `Pods`, ...), toolchain caches
+  (`.cargo/registry`, `go/pkg/mod`), and direct children of cache containers
+  (`Caches`, `.cache`). Add `ignore_candidate <path>` lines to `~/.diskledger/config`
+  to silence paths permanently. It does not check whether a process is using the
+  directory or who owns it. A matched directory that holds git repositories is
+  listed under `mixed`, not as a candidate; its repository-free direct children
+  are offered instead. Repositories are found among recorded directories and the
+  matched directory's direct children, so a small repository nested deeper can be
+  missed.
 
 ## State
 

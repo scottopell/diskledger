@@ -2,6 +2,7 @@
 //! deterministically against an in-memory simulator as well as real macOS APFS.
 
 use crate::kstat::{self, DirStat, VolumeInfo};
+use crate::store::GitKind;
 use crate::util;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
@@ -9,6 +10,12 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirMeta {
+    pub dev: u64,
+    pub mtime: u64,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectEntry {
@@ -26,8 +33,8 @@ pub struct DirListing {
     pub subdirs: Vec<PathBuf>,
     /// True when the directory had more than `max_children` subdirectories.
     pub too_many_children: bool,
-    /// True when a direct `.git` entry (file or directory) exists inside this directory.
-    pub has_git: bool,
+    /// Direct `.git` classification observed inside this directory.
+    pub git_kind: GitKind,
     /// True when the directory contains at least one direct non-directory, non-symlink entry
     /// (e.g. a regular file, FIFO, or unknown entry type).
     pub has_direct_files: bool,
@@ -41,17 +48,21 @@ pub trait System: Send + Sync {
         let (free, total) = self.volume_space(path)?;
         Ok(VolumeInfo { free, total, ..Default::default() })
     }
-    /// If `path` is a directory (following symlinks at the root), return `Ok(Some(dev))`.
+    /// If `path` is a directory (following symlinks at the root), return `Ok(Some(DirMeta))`.
     /// If it exists and is not a directory, return `Ok(None)`.
-    fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>>;
-    /// Device ID without following symlinks.
-    fn symlink_dev(&self, path: &Path) -> io::Result<u64>;
+    fn dir_meta(&self, path: &Path) -> io::Result<Option<DirMeta>>;
+    /// Convenience wrapper for `dir_meta(path).map(|o| o.map(|m| m.dev))`.
+    fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {
+        Ok(self.dir_meta(path)?.map(|m| m.dev))
+    }
+    /// Device ID and mtime without following symlinks.
+    fn symlink_meta(&self, path: &Path) -> io::Result<DirMeta>;
     /// List immediate non-symlink subdirectories (up to `max_children`) and detect direct `.git`.
     fn list_dir(&self, path: &Path, max_children: usize) -> io::Result<DirListing>;
     /// List immediate entries (directories, files, symlinks) with device ID and non-dir allocated bytes.
     fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>>;
-    /// True when `path/.git` exists (file or directory).
-    fn has_git(&self, path: &Path) -> bool;
+    /// Classify `path/.git` (Repo if directory, Worktree if regular file, else None).
+    fn git_kind(&self, path: &Path) -> GitKind;
     /// Current Unix timestamp in seconds.
     fn now(&self) -> u64;
 }
@@ -75,17 +86,24 @@ impl System for RealSystem {
         kstat::volume_info(path)
     }
 
-    fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {
+    fn dir_meta(&self, path: &Path) -> io::Result<Option<DirMeta>> {
         let m = fs::metadata(path)?;
         if m.is_dir() {
-            Ok(Some(m.dev()))
+            Ok(Some(DirMeta {
+                dev: m.dev(),
+                mtime: m.mtime().max(0) as u64,
+            }))
         } else {
             Ok(None)
         }
     }
 
-    fn symlink_dev(&self, path: &Path) -> io::Result<u64> {
-        Ok(fs::symlink_metadata(path)?.dev())
+    fn symlink_meta(&self, path: &Path) -> io::Result<DirMeta> {
+        let m = fs::symlink_metadata(path)?;
+        Ok(DirMeta {
+            dev: m.dev(),
+            mtime: m.mtime().max(0) as u64,
+        })
     }
 
     fn list_dir(&self, path: &Path, max_children: usize) -> io::Result<DirListing> {
@@ -119,7 +137,11 @@ impl System for RealSystem {
                 continue;
             }
             if name_bytes == b".git" {
-                out.has_git = true;
+                out.git_kind = match d_type {
+                    libc::DT_DIR => GitKind::Repo,
+                    libc::DT_REG => GitKind::Worktree,
+                    _ => self.git_kind(path),
+                };
             }
             let is_dir = match d_type {
                 libc::DT_DIR => true,
@@ -145,8 +167,8 @@ impl System for RealSystem {
                 if out.subdirs.len() > max_children {
                     out.subdirs.clear();
                     out.too_many_children = true;
-                    if !out.has_git {
-                        out.has_git = path.join(".git").exists();
+                    if !out.git_kind.is_git() {
+                        out.git_kind = self.git_kind(path);
                     }
                     return Ok(out);
                 }
@@ -219,8 +241,12 @@ impl System for RealSystem {
         Ok(out)
     }
 
-    fn has_git(&self, path: &Path) -> bool {
-        path.join(".git").exists()
+    fn git_kind(&self, path: &Path) -> GitKind {
+        match fs::metadata(path.join(".git")) {
+            Ok(m) if m.is_dir() => GitKind::Repo,
+            Ok(_) => GitKind::Worktree,
+            Err(_) => GitKind::None,
+        }
     }
 
     fn now(&self) -> u64 {

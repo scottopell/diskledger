@@ -1,5 +1,5 @@
 use crate::kstat;
-use crate::report;
+use crate::report::{self, CandidateKind, CandidateSort, CandidatesOpts};
 use crate::scan::{self, ScanOpts, ScanReport};
 use crate::store::{self, Config, Snapshot, Store};
 use crate::sys::{RealSystem, System};
@@ -34,7 +34,9 @@ USAGE
                                     subtracts monitored subtrees from partial parents.
                                     -k prints 'KiB<TAB>path', the same as 'du -sk'.
   diskledger top [dir]              Largest directories in the latest snapshot
-  diskledger candidates             Regenerable-looking directories (target, node_modules, ...)
+  diskledger candidates             Regenerable-looking directories (build, deps, caches)
+                                    Filter with --kind build|deps|cache, --older-than DUR;
+                                    rank with --sort size|age|score.
   diskledger status                 Free space, roots, snapshots, checkpoints
   diskledger doctor                 Verify the private APFS fsctl ABI against apfs.util -S
   diskledger agent install|uninstall|print [--interval SECS]
@@ -96,7 +98,14 @@ pub enum Command {
         json: bool,
     },
     Top { under: Option<String>, min: u64, depth: usize, policy: ScanPolicy, json: bool },
-    Candidates { min: u64, policy: ScanPolicy, json: bool },
+    Candidates {
+        min: u64,
+        kind: Option<CandidateKind>,
+        older_than: Option<u64>,
+        sort: CandidateSort,
+        policy: ScanPolicy,
+        json: bool,
+    },
     Status { json: bool },
     Doctor { json: bool },
     Root { action: RootAction },
@@ -401,17 +410,29 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             Ok(Command::Top { under: t.pos.into_iter().next(), min, depth, policy, json })
         }
         "candidates" => {
-            let t = tokenize(rest, &["--min", "--max-age"])?;
+            let t = tokenize(rest, &["--min", "--max-age", "--kind", "--older-than", "--sort"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut min = 500u64 << 20;
             let mut max_age = None;
+            let mut kind = None;
+            let mut older_than = None;
+            let mut sort = CandidateSort::Size;
             let (mut no_scan, mut json) = (false, false);
             for (k, v) in t.opts {
                 match k.as_str() {
                     "--min" => min = parse_size(&require_val(&k, v)?)?,
                     "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
+                    "--kind" => kind = Some(CandidateKind::parse(&require_val(&k, v)?)?),
+                    "--older-than" => {
+                        let s = require_val(&k, v)?;
+                        older_than = Some(
+                            parse_duration(&s)
+                                .ok_or_else(|| format!("bad --older-than '{s}' (use e.g. 24h, 7d)"))?,
+                        );
+                    }
+                    "--sort" => sort = CandidateSort::parse(&require_val(&k, v)?)?,
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
@@ -425,7 +446,7 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             }
             reject_extra_pos("candidates", &t.pos, 0)?;
             let policy = finish_policy(no_scan, max_age)?;
-            Ok(Command::Candidates { min, policy, json })
+            Ok(Command::Candidates { min, kind, older_than, sort, policy, json })
         }
         "status" => {
             let t = tokenize(rest, &[])?;
@@ -617,7 +638,9 @@ pub fn run(raw: &[String]) -> Res<()> {
         Command::Checkin { policy } => cmd_checkpoint(&sys, &store, policy, "checkin"),
         Command::Checkpoint { name, policy } => cmd_checkpoint(&sys, &store, policy, &name),
         Command::Top { under, min, depth, policy, json } => cmd_top(&sys, &store, under.as_deref(), min, depth, policy, json),
-        Command::Candidates { min, policy, json } => cmd_candidates(&sys, &store, min, policy, json),
+        Command::Candidates { min, kind, older_than, sort, policy, json } => {
+            cmd_candidates(&sys, &store, min, kind, older_than, sort, policy, json)
+        }
         Command::Status { json } => cmd_status(&store, json),
         Command::Doctor { json } => cmd_doctor(&store, json),
         Command::Root { action } => cmd_root(&sys, &store, action),
@@ -827,9 +850,34 @@ fn cmd_top(
     Ok(())
 }
 
-fn cmd_candidates(sys: &dyn System, store: &Store, min: u64, policy: ScanPolicy, json: bool) -> Res<()> {
+fn cmd_candidates(
+    sys: &dyn System,
+    store: &Store,
+    min: u64,
+    kind: Option<CandidateKind>,
+    older_than: Option<u64>,
+    sort: CandidateSort,
+    policy: ScanPolicy,
+    json: bool,
+) -> Res<()> {
     let cur = current_with(sys, store, policy, json)?;
-    report::candidates(store, &cur, min, json);
+    let ignore = store
+        .config()
+        .map(|c| {
+            c.ignore_candidates
+                .into_iter()
+                .map(|p| normalize_path_str(&p.to_string_lossy()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let opts = CandidatesOpts {
+        min_bytes: min,
+        kind,
+        older_than_secs: older_than,
+        sort,
+        ignore,
+    };
+    report::candidates(store, &cur, &opts, json);
     Ok(())
 }
 

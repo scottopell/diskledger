@@ -7,12 +7,13 @@ use diskledger::cli::{
 };
 use diskledger::kstat::{DirStat, VolumeInfo};
 use diskledger::report::{
-    compute_candidates, compute_diff, compute_size_children, compute_top, DiffStatus,
-    MonitoredState, SizeChildrenOpts,
+    compute_candidates, compute_diff, compute_size_children, compute_top, reclaim_score,
+    CandidateKind, CandidateOrigin, CandidateSort, CandidatesOpts, DiffStatus, MonitoredState,
+    SizeChildrenOpts,
 };
 use diskledger::scan::{self, ScanOpts};
-use diskledger::store::{Config, Snapshot, Store};
-use diskledger::sys::{DirListing, DirectEntry, System};
+use diskledger::store::{Config, GitKind, Snapshot, Store};
+use diskledger::sys::{DirListing, DirMeta, DirectEntry, System};
 use diskledger::util::{is_same_or_under, is_under, normalize_path_str, parent_of};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +68,7 @@ struct FakeDir {
     flagged: bool,
     gen: u64,
     unreadable: bool,
+    mtime: u64,
 }
 
 #[derive(Debug, Default)]
@@ -93,7 +95,10 @@ struct FakeFs {
 impl FakeFs {
     fn new(start_ts: u64) -> Self {
         let mut dirs = BTreeMap::new();
-        dirs.insert("/".into(), FakeDir { dev: 1, flagged: false, gen: 0, unreadable: false });
+        dirs.insert(
+            "/".into(),
+            FakeDir { dev: 1, flagged: false, gen: 0, unreadable: false, mtime: start_ts },
+        );
         FakeFs {
             state: Mutex::new(FakeState {
                 dirs,
@@ -140,14 +145,22 @@ impl FakeFs {
 
     fn mkdir(&self, path: &str, dev: u64) {
         let p = normalize_path_str(path);
+        let now = self.clock.load(Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         if st.dirs.contains_key(&p) {
             return;
         }
         st.dirs.insert(
             p.clone(),
-            FakeDir { dev, flagged: false, gen: 0, unreadable: false },
+            FakeDir { dev, flagged: false, gen: 0, unreadable: false, mtime: now },
         );
+        if let Some(par) = parent_of(&p) {
+            if let Some(d) = st.dirs.get_mut(par) {
+                if d.dev == dev {
+                    d.mtime = now;
+                }
+            }
+        }
         Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
@@ -160,21 +173,30 @@ impl FakeFs {
     fn write_file(&self, path: &str, bytes: u64) {
         let p = normalize_path_str(path);
         let Some(par) = parent_of(&p) else { return };
+        let now = self.clock.load(Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let Some(dev) = st.dirs.get(par).map(|d| d.dev) else { return };
         if st.dirs.contains_key(&p) || st.symlinks.contains_key(&p) {
             return;
         }
-        st.files.insert(p.clone(), bytes);
+        let existed = st.files.insert(p.clone(), bytes).is_some();
+        if !existed {
+            if let Some(d) = st.dirs.get_mut(par) {
+                d.mtime = now;
+            }
+        }
         Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn delete_file(&self, path: &str) {
         let p = normalize_path_str(path);
+        let now = self.clock.load(Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         if st.files.remove(&p).is_some() {
             if let Some(par) = parent_of(&p) {
-                if let Some(dev) = st.dirs.get(par).map(|d| d.dev) {
+                if let Some(d) = st.dirs.get_mut(par) {
+                    let dev = d.dev;
+                    d.mtime = now;
                     Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
                 }
             }
@@ -183,23 +205,35 @@ impl FakeFs {
 
     fn delete_dir_tree(&self, path: &str) {
         let p = normalize_path_str(path);
+        let now = self.clock.load(Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let Some(dev) = st.dirs.get(&p).map(|d| d.dev) else { return };
         st.dirs.retain(|k, _| !is_same_or_under(k, &p));
         st.files.retain(|k, _| !is_under(k, &p));
         st.symlinks.retain(|k, _| !is_under(k, &p));
+        if let Some(par) = parent_of(&p) {
+            if let Some(d) = st.dirs.get_mut(par) {
+                if d.dev == dev {
+                    d.mtime = now;
+                }
+            }
+        }
         Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
     fn add_symlink(&self, path: &str, target: &str) {
         let p = normalize_path_str(path);
         let Some(par) = parent_of(&p) else { return };
+        let now = self.clock.load(Ordering::Relaxed);
         let mut st = self.state.lock().unwrap();
         let Some(dev) = st.dirs.get(par).map(|d| d.dev) else { return };
         if st.dirs.contains_key(&p) || st.files.contains_key(&p) {
             return;
         }
         st.symlinks.insert(p.clone(), target.to_string());
+        if let Some(d) = st.dirs.get_mut(par) {
+            d.mtime = now;
+        }
         Self::bump_ancestors_locked(&mut st.dirs, &p, dev);
     }
 
@@ -302,10 +336,20 @@ impl FakeFs {
             .collect()
     }
 
-    fn dir_has_direct_git(&self, dir: &str) -> bool {
+    fn dir_git_kind(&self, dir: &str) -> GitKind {
         let git_path = if dir == "/" { "/.git".to_string() } else { format!("{dir}/.git") };
         let st = self.state.lock().unwrap();
-        st.files.contains_key(&git_path) || st.dirs.contains_key(&git_path)
+        if st.dirs.contains_key(&git_path) {
+            GitKind::Repo
+        } else if st.files.contains_key(&git_path) {
+            GitKind::Worktree
+        } else {
+            GitKind::None
+        }
+    }
+
+    fn dir_has_direct_git(&self, dir: &str) -> bool {
+        self.dir_git_kind(dir).is_git()
     }
 
     fn vol1_used(&self) -> u64 {
@@ -409,12 +453,12 @@ impl System for FakeFs {
         }
     }
 
-    fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {
+    fn dir_meta(&self, path: &Path) -> io::Result<Option<DirMeta>> {
         let p = normalize_path_str(&path.to_string_lossy());
         self.ops.lock().unwrap().dev_checks += 1;
         let st = self.state.lock().unwrap();
         if let Some(d) = st.dirs.get(&p) {
-            Ok(Some(d.dev))
+            Ok(Some(DirMeta { dev: d.dev, mtime: d.mtime }))
         } else if st.files.contains_key(&p) {
             Ok(None)
         } else {
@@ -422,16 +466,16 @@ impl System for FakeFs {
         }
     }
 
-    fn symlink_dev(&self, path: &Path) -> io::Result<u64> {
+    fn symlink_meta(&self, path: &Path) -> io::Result<DirMeta> {
         let p = normalize_path_str(&path.to_string_lossy());
         self.ops.lock().unwrap().dev_checks += 1;
         let st = self.state.lock().unwrap();
         if let Some(d) = st.dirs.get(&p) {
-            Ok(d.dev)
+            Ok(DirMeta { dev: d.dev, mtime: d.mtime })
         } else if let Some(par) = parent_of(&p) {
             st.dirs
                 .get(par)
-                .map(|d| d.dev)
+                .map(|d| DirMeta { dev: d.dev, mtime: d.mtime })
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "not found"))
@@ -450,7 +494,13 @@ impl System for FakeFs {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"));
         }
         let git_path = if p == "/" { "/.git".to_string() } else { format!("{p}/.git") };
-        let has_git = st.files.contains_key(&git_path) || st.dirs.contains_key(&git_path);
+        let git_kind = if st.dirs.contains_key(&git_path) {
+            GitKind::Repo
+        } else if st.files.contains_key(&git_path) {
+            GitKind::Worktree
+        } else {
+            GitKind::None
+        };
         let has_direct_files = st.files.keys().any(|k| parent_of(k) == Some(p.as_str()));
         let mut subdirs = Vec::new();
         for k in st.dirs.keys() {
@@ -460,13 +510,13 @@ impl System for FakeFs {
                     return Ok(DirListing {
                         subdirs: Vec::new(),
                         too_many_children: true,
-                        has_git,
+                        git_kind,
                         has_direct_files,
                     });
                 }
             }
         }
-        Ok(DirListing { subdirs, too_many_children: false, has_git, has_direct_files })
+        Ok(DirListing { subdirs, too_many_children: false, git_kind, has_direct_files })
     }
 
     fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>> {
@@ -518,10 +568,10 @@ impl System for FakeFs {
         Ok(out)
     }
 
-    fn has_git(&self, path: &Path) -> bool {
+    fn git_kind(&self, path: &Path) -> GitKind {
         let p = normalize_path_str(&path.to_string_lossy());
         self.ops.lock().unwrap().has_git += 1;
-        self.dir_has_direct_git(&p)
+        self.dir_git_kind(&p)
     }
 
     fn now(&self) -> u64 {
@@ -694,6 +744,7 @@ proptest! {
             max_depth: 5,
             max_children: 64,
             keep_snapshots: 5,
+            ..Config::default()
         };
         store.write_config(&cfg).expect("write initial config");
 
@@ -1182,7 +1233,11 @@ proptest! {
                     }
 
                     // 3. Candidates: JSON validity, no nested candidates, and no git-holding candidate.
-                    let cand = compute_candidates(&store, &cur, min);
+                    let cand = compute_candidates(
+                        &store,
+                        &cur,
+                        &CandidatesOpts { min_bytes: min, ..Default::default() },
+                    );
                     let mut cand_j = Vec::new();
                     cand.render_json(&mut cand_j).expect("candidates json");
                     let cand_jv = assert_json_valid(&cand_j, "candidates");
@@ -1197,6 +1252,7 @@ proptest! {
                         let ci = &cand.candidates[i];
                         prop_assert!(ci.unchanged_since <= cur.ts);
                         prop_assert_eq!(ci.unchanged_secs, cur.ts - ci.unchanged_since);
+                        prop_assert!(!diskledger::report::is_cache_container(&ci.path));
                         for j in 0..cand.candidates.len() {
                             if i != j {
                                 prop_assert!(
@@ -1217,7 +1273,7 @@ proptest! {
                             );
                             for (k, r) in cur.subtree(&ci.path) {
                                 prop_assert!(
-                                    !r.has_git,
+                                    !r.git_kind.is_git(),
                                     "candidate '{}' has recorded git repo '{}'!",
                                     ci.path,
                                     k
@@ -1254,7 +1310,7 @@ proptest! {
                             if !ci_unreadable && ci_depth < cfg.max_depth && ci_bytes >= cfg.record_min_bytes {
                                 if child_dirs.len() <= cfg.max_children {
                                     for cdir in child_dirs {
-                                        if diskledger::report::REGENERABLE.contains(&diskledger::util::base_name(&ci.path)) {
+                                        if diskledger::report::needs_direct_child_git_check(&ci.path) {
                                             prop_assert!(
                                                 !fs.dir_has_direct_git(&cdir),
                                                 "candidate '{}' has direct-child git repo '{}'!",
@@ -1342,6 +1398,7 @@ proptest! {
             max_depth: 6,
             max_children: 64,
             keep_snapshots: 10,
+            ..Config::default()
         };
         let s1 = fresh_scan_with(&fs, &store, &cfg, false, false, true).unwrap().snapshot;
 
@@ -1409,6 +1466,7 @@ proptest! {
             max_depth: 6,
             max_children: 200,
             keep_snapshots: 5,
+            ..Config::default()
         };
 
         // Initial snapshot records `root` and `big_flagged` as flagged.
@@ -1473,6 +1531,7 @@ proptest! {
             max_depth: 10,
             max_children: 64,
             keep_snapshots: 5,
+            ..Config::default()
         };
 
         let prev = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }).snapshot;
@@ -1530,6 +1589,7 @@ proptest! {
             max_depth: 6,
             max_children: 100,
             keep_snapshots: 5,
+            ..Config::default()
         };
 
         let prev = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }).snapshot;
@@ -1574,6 +1634,7 @@ proptest! {
             max_depth: 6,
             max_children: 64,
             keep_snapshots: 5,
+            ..Config::default()
         };
         store.write_config(&cfg).unwrap();
 
@@ -1767,5 +1828,189 @@ proptest! {
         // Removing the last remaining root must error and preserve config.
         prop_assert!(remove_roots_with(&store, &["/vol/base".to_string()]).is_err());
         prop_assert_eq!(store.config().unwrap().roots, vec![PathBuf::from("/vol/base")]);
+    }
+
+    /// Trustworthy `candidates` invariants:
+    /// - Cache containers (`Caches`, `.cache`) open into direct children instead of proposing the container
+    /// - Toolchain caches (`/.cargo/registry`, `/go/pkg/mod`) are classified as `Cache`
+    /// - Enclosing git origin distinguishes `Worktree` (`.git` file) vs `Repo` (`.git` dir) vs `Standalone`
+    /// - Blended staleness uses `mtime` for pre-history old dirs, never falsely claims active dirs are stale
+    /// - `--kind`, `--older-than`, `ignore_candidates`, and `--sort size|age|score` behave strictly
+    /// - `reclaim_score` is monotonic in both bytes and idle_secs
+    /// - Zero `FakeFs` ops during `compute_candidates`
+    #[test]
+    fn candidates_containers_worktree_staleness_sorting_and_ignore(
+        stale_days in 5u64..60,
+        active_edit_secs_ago in 10u64..1800,
+        bazel_mb in 100u64..500,
+        target_mb in 100u64..500,
+        wt_target_mb in 100u64..500,
+        deps_mb in 100u64..500,
+        gomod_mb in 100u64..500,
+        sort_idx in 0usize..3,
+    ) {
+        let home = TempHome::new("cand");
+        let store = Store::open_at(home.0.clone());
+        let t0 = 1_790_000_000u64;
+        let fs = FakeFs::new(t0);
+
+        fs.mkdir("/home", 1);
+        // 1. Stale cache container: /home/Caches/bazel (created at t0, untouched for `stale_days`)
+        fs.mkdir("/home/Caches", 1);
+        fs.mkdir("/home/Caches/bazel", 1);
+        fs.write_file("/home/Caches/bazel/cache.bin", bazel_mb << 20);
+        // Also an ignored cache child
+        fs.mkdir("/home/Caches/keepme", 1);
+        fs.write_file("/home/Caches/keepme/model.bin", 300 << 20);
+        // And a git repo nested inside /home/Caches (must NOT become a candidate!)
+        fs.mkdir("/home/Caches/cloned_repo", 1);
+        fs.mkdir("/home/Caches/cloned_repo/.git", 1);
+        fs.write_file("/home/Caches/cloned_repo/blob.bin", 250 << 20);
+
+        // 2. Main git repo (`.git` directory) with active `target` + `node_modules`
+        fs.mkdir("/home/dev", 1);
+        fs.mkdir("/home/dev/app", 1);
+        fs.mkdir("/home/dev/app/.git", 1);
+        fs.mkdir("/home/dev/app/target", 1);
+        fs.write_file("/home/dev/app/target/app.o", target_mb << 20);
+        fs.mkdir("/home/dev/app/node_modules", 1);
+        fs.write_file("/home/dev/app/node_modules/pkg.js", deps_mb << 20);
+
+        // 3. Linked git worktree (`.git` file!) with stale `target`
+        fs.mkdir("/home/dev/wt1", 1);
+        fs.write_file("/home/dev/wt1/.git", 64);
+        fs.mkdir("/home/dev/wt1/target", 1);
+        fs.write_file("/home/dev/wt1/target/wt.o", wt_target_mb << 20);
+
+        // 4. Toolchain cache: /home/go/pkg/mod
+        fs.mkdir("/home/go", 1);
+        fs.mkdir("/home/go/pkg", 1);
+        fs.mkdir("/home/go/pkg/mod", 1);
+        fs.write_file("/home/go/pkg/mod/mod.zip", gomod_mb << 20);
+
+        let cfg = Config {
+            roots: vec![
+                PathBuf::from("/home/Caches"),
+                PathBuf::from("/home/dev"),
+                PathBuf::from("/home/go"),
+            ],
+            ignore_candidates: vec![PathBuf::from("/home/Caches/keepme")],
+            flag_min_entries: 100,
+            record_min_bytes: 32 << 20,
+            max_depth: 8,
+            max_children: 64,
+            keep_snapshots: 10,
+            ..Config::default()
+        };
+        store.write_config(&cfg).unwrap();
+
+        // Advance `stale_days` BEFORE diskledger starts taking snapshots!
+        fs.advance_time(stale_days * 86400);
+        // Take first snapshot (history starts now, `stale_days` after creation)
+        let _s1 = fresh_scan_with(&fs, &store, &cfg, true, false, false).unwrap().snapshot;
+
+        // Advance 2 hours, edit `/home/dev/app/target` in-place (existing file: gen bumps, dir mtime old!)
+        fs.advance_time(7200);
+        fs.write_file("/home/dev/app/target/app.o", (target_mb + 1) << 20);
+        let _s2 = fresh_scan_with(&fs, &store, &cfg, false, false, false).unwrap().snapshot;
+
+        // Advance `active_edit_secs_ago` and take current snapshot.
+        fs.advance_time(active_edit_secs_ago);
+        let cur = fresh_scan_with(&fs, &store, &cfg, false, false, false).unwrap().snapshot;
+
+        let ops_before = fs.ops_total();
+        let sort = [CandidateSort::Size, CandidateSort::Age, CandidateSort::Score][sort_idx];
+        let rep = compute_candidates(
+            &store,
+            &cur,
+            &CandidatesOpts {
+                min_bytes: 50 << 20,
+                kind: None,
+                older_than_secs: None,
+                sort,
+                ignore: vec!["/home/Caches/keepme".to_string()],
+            },
+        );
+        prop_assert_eq!(fs.ops_total(), ops_before, "compute_candidates must make 0 fs ops");
+
+        // Cache container itself, ignored child, and git-holding child must NOT appear as candidates.
+        prop_assert!(rep.candidates.iter().all(|c| c.path != "/home/Caches"));
+        prop_assert!(rep.candidates.iter().all(|c| c.path != "/home/Caches/keepme"));
+        prop_assert!(rep.candidates.iter().all(|c| c.path != "/home/Caches/cloned_repo"));
+        prop_assert!(rep.mixed.iter().any(|m| m.path == "/home/Caches/cloned_repo"));
+
+        // Verify classifications, origins, and blended staleness.
+        let bazel = rep.candidates.iter().find(|c| c.path == "/home/Caches/bazel").expect("bazel candidate");
+        prop_assert_eq!(bazel.kind, CandidateKind::Cache);
+        prop_assert_eq!(bazel.origin, CandidateOrigin::Standalone);
+        prop_assert!(bazel.idle_secs >= stale_days * 86400, "bazel idle_secs should reflect pre-history mtime age");
+
+        let gomod = rep.candidates.iter().find(|c| c.path == "/home/go/pkg/mod").expect("go/pkg/mod candidate");
+        prop_assert_eq!(gomod.kind, CandidateKind::Cache);
+
+        let app_t = rep.candidates.iter().find(|c| c.path == "/home/dev/app/target").expect("app target");
+        prop_assert_eq!(app_t.kind, CandidateKind::Build);
+        prop_assert_eq!(app_t.origin, CandidateOrigin::Repo);
+        prop_assert_eq!(app_t.enclosing_repo.as_deref(), Some("/home/dev/app"));
+        // Even though app_t was edited in-place (old dir mtime), snapshot history saw the edit!
+        prop_assert_eq!(app_t.idle_secs, active_edit_secs_ago);
+
+        let wt_t = rep.candidates.iter().find(|c| c.path == "/home/dev/wt1/target").expect("wt1 target");
+        prop_assert_eq!(wt_t.kind, CandidateKind::Build);
+        prop_assert_eq!(wt_t.origin, CandidateOrigin::Worktree);
+        prop_assert_eq!(wt_t.enclosing_repo.as_deref(), Some("/home/dev/wt1"));
+        prop_assert!(wt_t.idle_secs >= stale_days * 86400);
+
+        let deps = rep.candidates.iter().find(|c| c.path == "/home/dev/app/node_modules").expect("node_modules");
+        prop_assert_eq!(deps.kind, CandidateKind::Deps);
+
+        // Total bytes exact + strict sort order + valid JSON.
+        prop_assert_eq!(rep.total_bytes, rep.candidates.iter().map(|c| c.bytes).sum::<u64>());
+        for w in rep.candidates.windows(2) {
+            match sort {
+                CandidateSort::Size => prop_assert!(w[0].bytes >= w[1].bytes),
+                CandidateSort::Age => prop_assert!(w[0].idle_secs >= w[1].idle_secs),
+                CandidateSort::Score => prop_assert!(w[0].score >= w[1].score),
+            }
+        }
+        let mut jbuf = Vec::new();
+        rep.render_json(&mut jbuf).unwrap();
+        assert_json_valid(&jbuf, "candidates v2 json");
+
+        // `--older-than 1d` excludes the active `app/target` while keeping stale `bazel` & `wt1/target`.
+        let stale_only = compute_candidates(
+            &store,
+            &cur,
+            &CandidatesOpts {
+                min_bytes: 50 << 20,
+                kind: None,
+                older_than_secs: Some(86400),
+                sort: CandidateSort::Score,
+                ignore: vec!["/home/Caches/keepme".to_string()],
+            },
+        );
+        prop_assert!(stale_only.candidates.iter().all(|c| c.idle_secs >= 86400));
+        prop_assert!(stale_only.candidates.iter().all(|c| c.path != "/home/dev/app/target"));
+        prop_assert!(stale_only.candidates.iter().any(|c| c.path == "/home/Caches/bazel"));
+        prop_assert!(stale_only.candidates.iter().any(|c| c.path == "/home/dev/wt1/target"));
+
+        // `--kind cache` keeps only cache candidates.
+        let cache_only = compute_candidates(
+            &store,
+            &cur,
+            &CandidatesOpts {
+                min_bytes: 50 << 20,
+                kind: Some(CandidateKind::Cache),
+                older_than_secs: None,
+                sort: CandidateSort::Size,
+                ignore: vec!["/home/Caches/keepme".to_string()],
+            },
+        );
+        prop_assert!(cache_only.candidates.iter().all(|c| c.kind == CandidateKind::Cache));
+        prop_assert_eq!(cache_only.candidates.len(), 2); // bazel + go/pkg/mod
+
+        // Score monotonicity sanity.
+        prop_assert!(reclaim_score((bazel_mb + 50) << 20, stale_days * 86400) >= reclaim_score(bazel_mb << 20, stale_days * 86400));
+        prop_assert!(reclaim_score(bazel_mb << 20, (stale_days + 10) * 86400) >= reclaim_score(bazel_mb << 20, stale_days * 86400));
     }
 }

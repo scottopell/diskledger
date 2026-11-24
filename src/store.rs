@@ -17,6 +17,8 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub roots: Vec<PathBuf>,
+    /// Paths (and their descendants) to omit from `candidates`.
+    pub ignore_candidates: Vec<PathBuf>,
     /// Directories with at least this many descendants get a kernel record.
     pub flag_min_entries: u64,
     /// Directories smaller than this are not recorded or descended into.
@@ -32,6 +34,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             roots: Vec::new(),
+            ignore_candidates: Vec::new(),
             flag_min_entries: 5_000,
             record_min_bytes: 64 << 20,
             max_depth: 12,
@@ -70,7 +73,39 @@ impl Config {
             }
         }
         self.roots = normalized.into_iter().map(PathBuf::from).collect();
+        let mut ignored = BTreeSet::new();
+        for p in &self.ignore_candidates {
+            let s = normalize_path_str(&p.to_string_lossy());
+            if !s.is_empty() {
+                ignored.insert(s);
+            }
+        }
+        self.ignore_candidates = ignored.into_iter().map(PathBuf::from).collect();
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GitKind {
+    #[default]
+    None,
+    /// Main git checkout (`.git` is a directory).
+    Repo,
+    /// Linked git worktree (`.git` is a regular file).
+    Worktree,
+}
+
+impl GitKind {
+    pub fn is_git(self) -> bool {
+        !matches!(self, GitKind::None)
+    }
+
+    pub fn as_code(self) -> u8 {
+        match self {
+            GitKind::None => 0,
+            GitKind::Repo => 1,
+            GitKind::Worktree => 2,
+        }
     }
 }
 
@@ -83,7 +118,9 @@ pub struct Row {
     /// Qualifies for a kernel record but does not have one yet.
     pub pending: bool,
     /// Direct `.git` entry observed inside this directory during scan.
-    pub has_git: bool,
+    pub git_kind: GitKind,
+    /// Directory `st_mtime` (Unix seconds) observed during scan; 0 if unavailable.
+    pub mtime: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +142,8 @@ pub struct Snapshot {
     pub extra_git_repos: BTreeSet<String>,
     /// False only when loaded from a legacy v0.1.2 (5-column) snapshot that lacked git metadata.
     pub has_git_metadata: bool,
+    /// False when loaded from a pre-mtime (5- or 6-column) snapshot.
+    pub has_mtime_metadata: bool,
     pub rows: BTreeMap<String, Row>,
 }
 
@@ -121,6 +160,7 @@ impl Default for Snapshot {
             single_volume: true,
             extra_git_repos: BTreeSet::new(),
             has_git_metadata: true,
+            has_mtime_metadata: true,
             rows: BTreeMap::new(),
         }
     }
@@ -178,6 +218,9 @@ impl Store {
         for r in &validated.roots {
             s.push_str(&format!("root {}\n", r.display()));
         }
+        for p in &validated.ignore_candidates {
+            s.push_str(&format!("ignore_candidate {}\n", p.display()));
+        }
         s.push_str(&format!(
             "\n# Give a directory its own kernel record once it holds this many entries.\nflag_min_entries {}\n",
             validated.flag_min_entries
@@ -211,6 +254,7 @@ impl Store {
             let num = || val.parse::<u64>().map_err(|_| format!("config line {}: '{val}' is not a number", n + 1));
             match key {
                 "root" => cfg.roots.push(PathBuf::from(val)),
+                "ignore_candidate" => cfg.ignore_candidates.push(PathBuf::from(val)),
                 "flag_min_entries" => cfg.flag_min_entries = num()?,
                 "record_min_bytes" => cfg.record_min_bytes = num()?,
                 "max_depth" => {
@@ -268,8 +312,17 @@ impl Store {
         }
         for (p, r) in &s.rows {
             let state = if r.flagged { 1 } else if r.pending { 2 } else { 0 };
-            let git = if r.has_git { 1 } else { 0 };
-            out.push_str(&format!("{}\t{}\t{}\t{}\t{}\t{}\n", tsv_esc(p), r.bytes, r.entries, r.gen, state, git));
+            let git = r.git_kind.as_code();
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tsv_esc(p),
+                r.bytes,
+                r.entries,
+                r.gen,
+                state,
+                git,
+                r.mtime
+            ));
         }
         let tmp = self.home.join("snapshots").join(unique_tmp_name(&s.ts.to_string()));
         fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, self.snap_path(s.ts))).map_err(|e| {
@@ -319,8 +372,8 @@ impl Store {
                 continue;
             }
             let f: Vec<&str> = line.split('\t').collect();
-            if f.len() != 5 && f.len() != 6 {
-                return Err(format!("corrupt snapshot {ts} line {lineno}: expected 5 or 6 columns, got {}", f.len()));
+            if f.len() < 5 || f.len() > 7 {
+                return Err(format!("corrupt snapshot {ts} line {lineno}: expected 5 to 7 columns, got {}", f.len()));
             }
             let bytes = f[1].parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad bytes '{}'", f[1]))?;
             let entries = f[2].parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad entries '{}'", f[2]))?;
@@ -331,19 +384,26 @@ impl Store {
                 "2" => (false, true),
                 other => return Err(format!("corrupt snapshot {ts} line {lineno}: bad state '{other}'")),
             };
-            let has_git = if f.len() == 6 {
+            let git_kind = if f.len() >= 6 {
                 match f[5] {
-                    "0" => false,
-                    "1" => true,
+                    "0" => GitKind::None,
+                    "1" => GitKind::Repo,
+                    "2" => GitKind::Worktree,
                     other => return Err(format!("corrupt snapshot {ts} line {lineno}: bad git flag '{other}'")),
                 }
             } else {
                 s.has_git_metadata = false;
-                false
+                GitKind::None
+            };
+            let mtime = if f.len() >= 7 {
+                f[6].parse().map_err(|_| format!("corrupt snapshot {ts} line {lineno}: bad mtime '{}'", f[6]))?
+            } else {
+                s.has_mtime_metadata = false;
+                0
             };
             s.rows.insert(
                 tsv_unesc(f[0]),
-                Row { bytes, entries, gen, flagged, pending, has_git },
+                Row { bytes, entries, gen, flagged, pending, git_kind, mtime },
             );
         }
         Ok(s)
