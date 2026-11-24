@@ -1349,4 +1349,61 @@ proptest! {
         prop_assert_eq!(rep.snapshot.rows, full.snapshot.rows);
         prop_assert_eq!(rep.would_flag, full.would_flag);
     }
+
+    /// Structural walk-bound invariant: when a flagged parent has many LARGE
+    /// (>= record_min_bytes) unflagged siblings (so remaining-budget pruning cannot
+    /// skip them) and mutations happen strictly inside a flagged descendant subtree,
+    /// frontier gen-delta accounting must incur ZERO kernel walks on all unflagged
+    /// siblings and intermediate containers, while matching a full scan identically.
+    #[test]
+    fn frontier_gen_accounting_skips_large_unflagged_siblings(
+        n_large_siblings in 3usize..20,
+        sibling_bytes in (80u64 << 20)..(200u64 << 20),
+        delta_bytes in 1u64..(10u64 << 20),
+        flag_mode in any::<bool>(),
+    ) {
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/vol", 1);
+        fs.mkdir("/vol/root", 1);
+        fs.mkdir("/vol/root/mid", 1);
+        fs.mkdir("/vol/root/mid/active_flagged", 1);
+        fs.write_file("/vol/root/mid/active_flagged/base.bin", 100 << 20);
+        fs.flag(Path::new("/vol/root/mid/active_flagged")).unwrap();
+        fs.flag(Path::new("/vol/root")).unwrap();
+
+        for i in 0..n_large_siblings {
+            let sib = format!("/vol/root/large_unflagged_{i:02}");
+            fs.mkdir(&sib, 1);
+            fs.write_file(&format!("{sib}/big.bin"), sibling_bytes);
+        }
+
+        let cfg = Config {
+            roots: vec![PathBuf::from("/vol/root")],
+            flag_min_entries: 5_000,
+            record_min_bytes: 64 << 20,
+            max_depth: 6,
+            max_children: 100,
+            keep_snapshots: 5,
+        };
+
+        let prev = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false }).snapshot;
+        // Mutate strictly inside the flagged descendant!
+        fs.write_file("/vol/root/mid/active_flagged/edit.bin", delta_bytes);
+
+        let before = fs.ops_snapshot();
+        let rep = scan::run(&fs, &cfg, Some(&prev), &ScanOpts { flag: flag_mode, verbose: false });
+        let after = fs.ops_snapshot();
+
+        prop_assert_eq!(
+            after.walks - before.walks,
+            0,
+            "mutations inside flagged descendant must incur 0 kernel walks on {} large unflagged siblings",
+            n_large_siblings
+        );
+        prop_assert_eq!(after.walked_entries - before.walked_entries, 0);
+
+        let full = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false });
+        prop_assert_eq!(rep.snapshot.rows, full.snapshot.rows);
+        prop_assert_eq!(rep.would_flag, full.would_flag);
+    }
 }

@@ -15,7 +15,7 @@ use crate::kstat::{self, DirStat};
 use crate::report::REGENERABLE;
 use crate::store::{Config, Row, Snapshot};
 use crate::sys::System;
-use crate::util::{base_name, normalize_path_str, parent_of};
+use crate::util::{base_name, is_under, normalize_path_str, parent_of};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -507,6 +507,14 @@ impl<'a> SharedCtx<'a> {
         };
 
         if prefetched.is_none() && st.has_record && self.reuse_unchanged(&key, &st, depth) {
+            return VisitRes {
+                covered: st.entries + 1,
+                bytes: st.bytes,
+                entries_plus_self: st.entries + 1,
+            };
+        }
+
+        if st.has_record && self.try_reuse_via_frontier(&key, &st, depth, dev, pool) {
             return VisitRes {
                 covered: st.entries + 1,
                 bytes: st.bytes,
@@ -1010,6 +1018,226 @@ impl<'a> SharedCtx<'a> {
         }
         drop(out);
         self.reused.fetch_add(n, Ordering::Relaxed);
+        true
+    }
+
+    /// APFS propagates every mutation's generation-count increment identically up
+    /// through all flagged ancestors. When a dirty flagged directory's `(dgen,
+    /// dbytes, dentries)` is 100% accounted for by its maximal flagged descendants
+    /// from `prev`, nothing outside that flagged frontier changed: reuse all
+    /// unflagged rows in between (adjusting intermediate ancestor totals) and only
+    /// recurse into the dirty frontier subtrees.
+    fn try_reuse_via_frontier(
+        &self,
+        key: &str,
+        st: &DirStat,
+        depth: u32,
+        dev: u64,
+        pool: Option<&Pool<'a>>,
+    ) -> bool {
+        let Some(prev) = self.prev else { return false };
+        let Some(old) = prev.rows.get(key) else { return false };
+        if !old.flagged || old.gen == 0 || st.gen < old.gen {
+            return false;
+        }
+        let min = self.cfg.record_min_bytes;
+        if st.bytes < min || depth >= self.cfg.max_depth {
+            return false;
+        }
+
+        // Collect maximal flagged strict descendants of `key` from `prev`.
+        let mut frontier: Vec<(&str, &Row, u32)> = Vec::new();
+        for (p, r) in prev.subtree(key) {
+            if p.as_str() == key {
+                continue;
+            }
+            if frontier.iter().any(|(f, _, _)| is_under(p, f)) {
+                continue;
+            }
+            if r.flagged {
+                let rel = if key == "/" {
+                    p.matches('/').count() as u32
+                } else {
+                    p[key.len()..].matches('/').count() as u32
+                };
+                let f_depth = depth + rel;
+                if f_depth > self.cfg.max_depth {
+                    return false;
+                }
+                frontier.push((p.as_str(), r, f_depth));
+            }
+        }
+        if frontier.is_empty() {
+            return false;
+        }
+
+        // Probe every frontier directory (each is flagged -> microseconds).
+        let mut sum_dgen: u64 = 0;
+        let mut sum_dbytes: i128 = 0;
+        let mut sum_dentries: i128 = 0;
+        let mut dirty: Vec<(&str, DirStat, i128, i128, u32)> = Vec::new();
+        let mut clean: Vec<(&str, DirStat, u32)> = Vec::new();
+
+        for &(fp, old_f, f_depth) in &frontier {
+            let p = Path::new(fp);
+            if !self.sys.symlink_dev(p).map(|d| d == dev).unwrap_or(false) {
+                return false;
+            }
+            let Ok(cst) = self.sys.query(p) else { return false };
+            self.queried.fetch_add(1, Ordering::Relaxed);
+            if !cst.has_record {
+                self.walked.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+            if cst.gen < old_f.gen {
+                return false;
+            }
+            let dg = cst.gen - old_f.gen;
+            let db = cst.bytes as i128 - old_f.bytes as i128;
+            let de = cst.entries as i128 - old_f.entries as i128;
+            sum_dgen = match sum_dgen.checked_add(dg) {
+                Some(v) => v,
+                None => return false,
+            };
+            sum_dbytes += db;
+            sum_dentries += de;
+            if dg != 0 || db != 0 || de != 0 {
+                if cst.bytes < min {
+                    return false;
+                }
+                dirty.push((fp, cst, db, de, f_depth));
+            } else {
+                clean.push((fp, cst, f_depth));
+            }
+        }
+
+        // Exact APFS conservation check: all mutations happened strictly inside `frontier`.
+        let want_dgen = st.gen - old.gen;
+        let want_dbytes = st.bytes as i128 - old.bytes as i128;
+        let want_dentries = st.entries as i128 - old.entries as i128;
+        if sum_dgen != want_dgen || sum_dbytes != want_dbytes || sum_dentries != want_dentries {
+            return false;
+        }
+
+        // Verify all non-frontier rows in `prev.subtree(key)` stay valid and tree-closed.
+        let mut descendable: BTreeSet<&str> = BTreeSet::new();
+        let mut depths: HashMap<&str, u32> = HashMap::new();
+        let mut local_rows: Vec<(String, Row)> = Vec::new();
+        let mut local_would: Vec<String> = Vec::new();
+
+        for (p, r) in prev.subtree(key) {
+            if p.as_str() == key {
+                local_rows.push((
+                    p.clone(),
+                    Row {
+                        bytes: st.bytes,
+                        entries: st.entries,
+                        gen: st.gen,
+                        flagged: true,
+                        pending: false,
+                        has_git: r.has_git,
+                    },
+                ));
+                depths.insert(p.as_str(), depth);
+                descendable.insert(p.as_str());
+                continue;
+            }
+            if frontier.iter().any(|(f, _, _)| p.as_str() == *f || is_under(p, f)) {
+                continue;
+            }
+            if self.opts.flag && r.pending {
+                return false;
+            }
+            let Some(par) = parent_of(p) else { continue };
+            if !descendable.contains(par) {
+                continue;
+            }
+            let p_depth = depths[par] + 1;
+            if p_depth > self.cfg.max_depth {
+                continue;
+            }
+            let mut db = 0i128;
+            let mut de = 0i128;
+            let mut has_dirty_desc = false;
+            for &(fp, _, fdb, fde, _) in &dirty {
+                if is_under(fp, p) {
+                    db += fdb;
+                    de += fde;
+                    has_dirty_desc = true;
+                }
+            }
+            let Ok(new_bytes) = u64::try_from(r.bytes as i128 + db) else { return false };
+            let Ok(new_entries) = u64::try_from(r.entries as i128 + de) else { return false };
+            if has_dirty_desc && new_bytes < min {
+                return false;
+            }
+            if !r.pending && new_bytes < min {
+                continue;
+            }
+            if r.pending {
+                local_would.push(p.clone());
+            }
+            local_rows.push((
+                p.clone(),
+                Row {
+                    bytes: new_bytes,
+                    entries: new_entries,
+                    gen: r.gen,
+                    flagged: r.flagged,
+                    pending: r.pending,
+                    has_git: r.has_git,
+                },
+            ));
+            depths.insert(p.as_str(), p_depth);
+            if new_bytes >= min && p_depth < self.cfg.max_depth {
+                descendable.insert(p.as_str());
+            }
+        }
+
+        // Every frontier item's parent must be descendable (in case max_depth shrank).
+        for &(fp, _, _) in &frontier {
+            if let Some(par) = parent_of(fp) {
+                if !descendable.contains(par) {
+                    return false;
+                }
+            }
+        }
+
+        // Commit reused non-frontier rows and preserved `extra_git_repos`.
+        let reused_n = local_rows.len() as u64;
+        {
+            let mut out = self.out.lock().unwrap();
+            for (p, r) in local_rows {
+                out.rows.insert(p, r);
+            }
+            out.would_flag.extend(local_would);
+            for g in &prev.extra_git_repos {
+                if parent_of(g).map_or(false, |par| descendable.contains(par))
+                    && !frontier.iter().any(|(f, _, _)| g.as_str() == *f || is_under(g, f))
+                    && !out.rows.contains_key(g)
+                {
+                    out.extra_git_repos.insert(g.clone());
+                }
+            }
+        }
+        self.reused.fetch_add(reused_n, Ordering::Relaxed);
+
+        // Reuse clean frontier subtrees (or move them to `dirty` if flagging & pending inside).
+        let mut to_visit: Vec<(PathBuf, DirStat, u32)> = Vec::new();
+        for (fp, cst, f_depth) in clean {
+            if !self.reuse_unchanged(fp, &cst, f_depth) {
+                to_visit.push((PathBuf::from(fp), cst, f_depth));
+            }
+        }
+        for (fp, cst, _, _, f_depth) in dirty {
+            to_visit.push((PathBuf::from(fp), cst, f_depth));
+        }
+
+        // Visit dirty frontier subtrees (each fans out internally via `pool`).
+        for (fp, cst, f_depth) in to_visit {
+            self.visit(&fp, f_depth, dev, false, Some(cst), pool);
+        }
+
         true
     }
 }

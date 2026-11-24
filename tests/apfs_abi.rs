@@ -72,6 +72,57 @@ fn doctor_verifies_real_apfs_abi_and_renders_valid_json() {
     assert_eq!(v["ok"], serde_json::Value::Bool(true));
 }
 
+#[test]
+fn real_apfs_gen_delta_conservation_for_frontier_reuse() {
+    let dir = EphemeralDir::new("gen-delta");
+    let flagged_a = dir.0.join("flagged_a");
+    let unflagged_b = dir.0.join("unflagged_b");
+    fs::create_dir_all(&flagged_a).unwrap();
+    fs::create_dir_all(&unflagged_b).unwrap();
+    write_synced(&flagged_a.join("f1.bin"), 4096);
+    write_synced(&unflagged_b.join("f2.bin"), 8192);
+
+    kstat::flag(&flagged_a).unwrap();
+    kstat::flag(&dir.0).unwrap();
+
+    let p0 = kstat::query(&dir.0).unwrap();
+    let a0 = kstat::query(&flagged_a).unwrap();
+
+    // 1. Mutations strictly inside flagged_a must advance parent & child gen identically.
+    write_synced(&flagged_a.join("f3.bin"), 16384);
+    let p1 = kstat::query(&dir.0).unwrap();
+    let a1 = kstat::query(&flagged_a).unwrap();
+    assert!(p1.gen > p0.gen);
+    assert_eq!(p1.gen - p0.gen, a1.gen - a0.gen);
+    assert_eq!(p1.bytes - p0.bytes, a1.bytes - a0.bytes);
+    assert_eq!(p1.entries - p0.entries, a1.entries - a0.entries);
+
+    // 2. Moving a file from unflagged_b into flagged_a must leave unexplained parent gen delta > 0.
+    fs::rename(unflagged_b.join("f2.bin"), flagged_a.join("f2.bin")).unwrap();
+    let p2 = kstat::query(&dir.0).unwrap();
+    let a2 = kstat::query(&flagged_a).unwrap();
+    assert!(
+        (p2.gen - p1.gen) > (a2.gen - a1.gen),
+        "cross-boundary rename B->A must produce unexplained parent dgen"
+    );
+
+    // 3. Moving a file from flagged_a out to unflagged_b must also leave unexplained parent gen delta > 0.
+    fs::rename(flagged_a.join("f2.bin"), unflagged_b.join("f2.bin")).unwrap();
+    let p3 = kstat::query(&dir.0).unwrap();
+    let a3 = kstat::query(&flagged_a).unwrap();
+    assert!(
+        (p3.gen - p2.gen) > (a3.gen - a2.gen),
+        "cross-boundary rename A->B must produce unexplained parent dgen"
+    );
+
+    // 4. Editing inside unflagged_b bumps parent gen with 0 change to flagged_a.
+    write_synced(&unflagged_b.join("f4.bin"), 4096);
+    let p4 = kstat::query(&dir.0).unwrap();
+    let a4 = kstat::query(&flagged_a).unwrap();
+    assert!(p4.gen > p3.gen);
+    assert_eq!(a4.gen, a3.gen);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 6, ..ProptestConfig::default() })]
 
