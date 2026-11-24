@@ -3,7 +3,8 @@
 
 use diskledger::cli::{parse_args, AgentAction, Command, RootAction, ScanPolicy};
 use diskledger::kstat::{parse_apfs_util_s, DirStat};
-use diskledger::store::{Config, Row, Snapshot, Store};
+use diskledger::report::{CandidateKind, CandidateSort};
+use diskledger::store::{Config, GitKind, Row, Snapshot, Store};
 use diskledger::util::{
     fmt_ts, json_str, normalize_path_str, parse_duration, parse_size, tsv_esc, tsv_unesc,
 };
@@ -260,8 +261,24 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                 (Command::Top { under, min, depth, policy, json }, argv)
             }),
         // candidates
-        (proptest::option::of(size_arg_strategy()), policy_strategy(), any::<bool>(), any::<bool>())
-            .prop_map(|(min_opt, (policy, ma_fmt), json, eq_style)| {
+        (
+            proptest::option::of(size_arg_strategy()),
+            proptest::option::of(prop_oneof![
+                Just(CandidateKind::Build),
+                Just(CandidateKind::Deps),
+                Just(CandidateKind::Cache),
+            ]),
+            proptest::option::of(1u64..30),
+            proptest::option::of(prop_oneof![
+                Just(CandidateSort::Size),
+                Just(CandidateSort::Age),
+                Just(CandidateSort::Score),
+            ]),
+            policy_strategy(),
+            any::<bool>(),
+            any::<bool>(),
+        )
+            .prop_map(|(min_opt, kind, older_days, sort_opt, (policy, ma_fmt), json, eq_style)| {
                 let mut argv = vec!["candidates".to_string()];
                 let min = if let Some((s, bytes)) = min_opt {
                     push_opt(&mut argv, "--min", &s, eq_style);
@@ -269,11 +286,24 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                 } else {
                     500 << 20
                 };
+                if let Some(k) = kind {
+                    push_opt(&mut argv, "--kind", k.as_str(), eq_style);
+                }
+                let older_than = older_days.map(|d| {
+                    push_opt(&mut argv, "--older-than", &format!("{d}d"), eq_style);
+                    d * 86400
+                });
+                let sort = if let Some(s) = sort_opt {
+                    push_opt(&mut argv, "--sort", s.as_str(), eq_style);
+                    s
+                } else {
+                    CandidateSort::Size
+                };
                 push_policy(&mut argv, policy, ma_fmt);
                 if json {
                     argv.push("--json".into());
                 }
-                (Command::Candidates { min, policy, json }, argv)
+                (Command::Candidates { min, kind, older_than, sort, policy, json }, argv)
             }),
         // status
         any::<bool>().prop_map(|json| {
@@ -578,7 +608,8 @@ proptest! {
         bytes in any::<u64>(),
         entries in any::<u64>(),
         gen in any::<u64>(),
-        bad_col in 1usize..=5,
+        mtime in any::<u64>(),
+        bad_col in 1usize..=6,
     ) {
         let dir = TempDir::new("corrupt");
         let store = Store::open_at(dir.0.clone());
@@ -593,17 +624,19 @@ proptest! {
         .unwrap();
         let loaded = store.load(ts).expect("legacy 5-col snapshot must load");
         prop_assert!(!loaded.has_git_metadata);
+        prop_assert!(!loaded.has_mtime_metadata);
         prop_assert!(loaded.single_volume);
         prop_assert_eq!(loaded.rows["/vol/a"].bytes, bytes);
 
-        // Now corrupt one field in a 6-column snapshot: load MUST error, never default to 0.
+        // Now corrupt one field in a 7-column snapshot: load MUST error, never default to 0.
         let mut cols = vec![
             "/vol/a".to_string(),
             bytes.to_string(),
             entries.to_string(),
             gen.to_string(),
             "1".to_string(),
-            "0".to_string(),
+            "2".to_string(),
+            mtime.to_string(),
         ];
         cols[bad_col] = "NOT_VALID".to_string();
         let bad_ts = ts + 1;
@@ -615,7 +648,7 @@ proptest! {
         .unwrap();
         prop_assert!(store.load(bad_ts).is_err(), "corrupt column {bad_col} must fail load");
 
-        // Also verify normal save/load roundtrip on Snapshot with weird path.
+        // Also verify normal save/load roundtrip on Snapshot with weird path, Worktree git_kind, and mtime.
         let mut snap = Snapshot {
             ts: ts + 2,
             free: 1234,
@@ -626,7 +659,7 @@ proptest! {
         };
         snap.rows.insert(
             "/vol/a/weird\t\r\n\\dir".into(),
-            Row { bytes, entries, gen, flagged: true, pending: false, has_git: true },
+            Row { bytes, entries, gen, flagged: true, pending: false, git_kind: GitKind::Worktree, mtime },
         );
         store.save(&snap).unwrap();
         prop_assert_eq!(store.load(snap.ts).unwrap(), snap);

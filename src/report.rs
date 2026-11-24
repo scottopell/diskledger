@@ -1,6 +1,6 @@
 //! Pure report computation plus human and JSON rendering for diff, top, and candidates.
 
-use crate::store::{Snapshot, Store};
+use crate::store::{GitKind, Snapshot, Store};
 use crate::sys::System;
 use crate::util::{
     base_name, fmt_age, fmt_ts, human, human_delta, is_same_or_under, is_under, json_str,
@@ -12,11 +12,125 @@ use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Directory names that usually hold regenerable output.
-pub const REGENERABLE: &[&str] = &[
-    "target", "node_modules", "incremental", "DerivedData", ".build", "build", "dist", ".next",
-    "__pycache__", ".venv", "venv", ".gradle", "Pods", ".turbo", ".cache",
+/// Build output directory names.
+pub const BUILD_DIRS: &[&str] = &[
+    "target", "incremental", "DerivedData", ".build", "build", "dist", ".next", "zig-out",
+    "zig-cache",
 ];
+
+/// Installed dependency directory names.
+pub const DEPS_DIRS: &[&str] = &["node_modules", ".venv", "venv", "Pods"];
+
+/// Direct tool cache directory names.
+pub const CACHE_DIRS: &[&str] = &[
+    "__pycache__", ".gradle", ".turbo", ".parcel-cache", ".pytest_cache", ".mypy_cache",
+    ".ruff_cache", ".tox",
+];
+
+/// Cache container directories whose repository-free direct children are offered as candidates
+/// rather than proposing the whole container.
+pub const CACHE_CONTAINERS: &[&str] = &["Caches", ".cache"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    Build,
+    Deps,
+    Cache,
+}
+
+impl CandidateKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CandidateKind::Build => "build",
+            CandidateKind::Deps => "deps",
+            CandidateKind::Cache => "cache",
+        }
+    }
+
+    pub fn parse(s: &str) -> Res<Self> {
+        match s {
+            "build" => Ok(CandidateKind::Build),
+            "deps" => Ok(CandidateKind::Deps),
+            "cache" => Ok(CandidateKind::Cache),
+            other => Err(format!("unknown --kind '{other}' (expected: build, deps, cache)")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateOrigin {
+    Worktree,
+    Repo,
+    Standalone,
+}
+
+impl CandidateOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CandidateOrigin::Worktree => "worktree",
+            CandidateOrigin::Repo => "repo",
+            CandidateOrigin::Standalone => "standalone",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CandidateSort {
+    #[default]
+    Size,
+    Age,
+    Score,
+}
+
+impl CandidateSort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CandidateSort::Size => "size",
+            CandidateSort::Age => "age",
+            CandidateSort::Score => "score",
+        }
+    }
+
+    pub fn parse(s: &str) -> Res<Self> {
+        match s {
+            "size" => Ok(CandidateSort::Size),
+            "age" => Ok(CandidateSort::Age),
+            "score" => Ok(CandidateSort::Score),
+            other => Err(format!("unknown --sort '{other}' (expected: size, age, score)")),
+        }
+    }
+}
+
+pub fn is_cache_container(path: &str) -> bool {
+    CACHE_CONTAINERS.contains(&base_name(path))
+}
+
+/// Classify a path by name or well-known toolchain cache subpath.
+pub fn classify_candidate(path: &str) -> Option<CandidateKind> {
+    let base = base_name(path);
+    if BUILD_DIRS.contains(&base) {
+        return Some(CandidateKind::Build);
+    }
+    if DEPS_DIRS.contains(&base) {
+        return Some(CandidateKind::Deps);
+    }
+    if CACHE_DIRS.contains(&base) {
+        return Some(CandidateKind::Cache);
+    }
+    if path.ends_with("/.cargo/registry")
+        || path.ends_with("/.cargo/git")
+        || path.ends_with("/go/pkg/mod")
+    {
+        return Some(CandidateKind::Cache);
+    }
+    None
+}
+
+/// True when `scan` should check direct children of `path` for small `.git` repos even if
+/// those children are below `record_min_bytes`.
+pub fn needs_direct_child_git_check(path: &str) -> bool {
+    classify_candidate(path).is_some() || is_cache_container(path)
+}
 
 fn bytes_of(s: &Snapshot, p: &str) -> u64 {
     s.rows.get(p).map(|r| r.bytes).unwrap_or(0)
@@ -545,7 +659,7 @@ pub fn top(s: &Snapshot, min: u64, max_depth: usize, under: Option<&str>, now_ts
 fn nested_repos(cur: &Snapshot, p: &str) -> Vec<String> {
     let mut found: BTreeSet<String> = cur
         .subtree(p)
-        .filter(|(_, r)| r.has_git)
+        .filter(|(_, r)| r.git_kind.is_git())
         .map(|(k, _)| k.clone())
         .collect();
     for g in &cur.extra_git_repos {
@@ -556,12 +670,63 @@ fn nested_repos(cur: &Snapshot, p: &str) -> Vec<String> {
     found.into_iter().collect()
 }
 
+/// Nearest ancestor in `cur.rows` holding `.git` (worktree or main repo), pure from snapshot.
+fn enclosing_origin(cur: &Snapshot, p: &str) -> (CandidateOrigin, Option<String>) {
+    let mut anc = parent_of(p);
+    while let Some(a) = anc {
+        if let Some(row) = cur.rows.get(a) {
+            match row.git_kind {
+                GitKind::Worktree => return (CandidateOrigin::Worktree, Some(a.to_string())),
+                GitKind::Repo => return (CandidateOrigin::Repo, Some(a.to_string())),
+                GitKind::None => {}
+            }
+        }
+        anc = parent_of(a);
+    }
+    (CandidateOrigin::Standalone, None)
+}
+
+/// Maximum recorded directory `mtime` at or beneath `p`, or `None` when absent.
+fn subtree_last_modified(cur: &Snapshot, p: &str) -> Option<u64> {
+    let m = cur
+        .subtree(p)
+        .map(|(_, r)| r.mtime)
+        .filter(|&mt| mt > 0)
+        .max()?;
+    Some(m.min(cur.ts))
+}
+
+/// Monotonic reclaimability score: `MiB * (floor(log2(idle_hours + 1)) + 1)`.
+pub fn reclaim_score(bytes: u64, idle_secs: u64) -> u64 {
+    let mib = bytes >> 20;
+    let hours = idle_secs / 3600;
+    let age_weight = (64 - hours.saturating_add(1).leading_zeros()) as u64;
+    mib.saturating_mul(age_weight.max(1))
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CandidatesOpts {
+    pub min_bytes: u64,
+    pub kind: Option<CandidateKind>,
+    pub older_than_secs: Option<u64>,
+    pub sort: CandidateSort,
+    pub ignore: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateItem {
     pub path: String,
     pub bytes: u64,
+    pub kind: CandidateKind,
+    pub origin: CandidateOrigin,
+    pub enclosing_repo: Option<String>,
     pub unchanged_since: u64,
     pub unchanged_secs: u64,
+    /// Max recorded directory mtime across the candidate's recorded subtree, if available.
+    pub last_modified: Option<u64>,
+    /// Best estimate of idle time blending snapshot history and recorded directory mtime.
+    pub idle_secs: u64,
+    pub score: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -578,47 +743,57 @@ pub struct CandidatesReport {
     pub history_starts: u64,
     pub total_bytes: u64,
     pub has_git_metadata: bool,
+    pub has_mtime_metadata: bool,
+    pub sort: CandidateSort,
     pub candidates: Vec<CandidateItem>,
     pub mixed: Vec<MixedItem>,
 }
 
-/// Regenerable-looking directories, largest first, with how long each has been unchanged.
+/// Regenerable-looking directories with category, git origin, and blended staleness.
 ///
-/// A directory with a build-output name that holds git repositories is reported as `mixed`
-/// instead of as a candidate; its repository-free direct children take its place.
+/// Cache containers (`Caches`, `.cache`) open automatically so their repo-free direct children
+/// are offered individually. Any matched directory that holds git repositories is reported under
+/// `mixed` instead of as a candidate; its repository-free direct children take its place.
 /// Pure with respect to the monitored filesystem: reads only `cur` and stored snapshots.
-pub fn compute_candidates(store: &Store, cur: &Snapshot, min: u64) -> CandidatesReport {
-    let mut picks: Vec<&str> = Vec::new();
+pub fn compute_candidates(store: &Store, cur: &Snapshot, opts: &CandidatesOpts) -> CandidatesReport {
+    let norm_ignore: Vec<String> = opts.ignore.iter().map(|s| normalize_path_str(s)).collect();
+    let is_ignored = |p: &str| norm_ignore.iter().any(|ig| is_same_or_under(p, ig));
+
+    let mut picks: Vec<(&str, CandidateKind)> = Vec::new();
     let mut mixed: Vec<(&str, Vec<String>)> = Vec::new();
-    // Name-matched directories that hold repositories; their direct children get considered.
-    let mut opened: BTreeSet<&str> = BTreeSet::new();
+    // Opened parent -> kind inherited by its promoted direct children.
+    let mut opened: BTreeMap<&str, CandidateKind> = BTreeMap::new();
+
     // Rows iterate parents before children, so `picks` already holds any picked ancestor.
     for (p, r) in &cur.rows {
         let p = p.as_str();
-        if r.bytes < min {
+        if r.bytes < opts.min_bytes || is_ignored(p) {
             continue;
         }
-        let named = REGENERABLE.contains(&base_name(p));
-        let promoted = parent_of(p).map_or(false, |a| opened.contains(a));
-        if !named && !promoted {
+        if picks.iter().any(|(a, _)| is_under(p, a)) {
             continue;
         }
-        if picks.iter().any(|a| is_under(p, a)) {
+        if is_cache_container(p) {
+            opened.insert(p, CandidateKind::Cache);
             continue;
         }
+        let direct_kind = classify_candidate(p);
+        let promoted_kind = parent_of(p).and_then(|a| opened.get(a).copied());
+        let Some(kind) = direct_kind.or(promoted_kind) else {
+            continue;
+        };
         let repos = nested_repos(cur, p);
         if repos.is_empty() {
-            picks.push(p);
-        } else if named {
-            opened.insert(p);
+            picks.push((p, kind));
+        } else {
+            opened.insert(p, kind);
             mixed.push((p, repos));
         }
     }
-    picks.sort_by(|a, b| bytes_of(cur, b).cmp(&bytes_of(cur, a)).then_with(|| a.cmp(b)));
 
     // Walk full stored history backwards to find how long each pick has been unchanged.
-    let mut unchanged_since: BTreeMap<&str, u64> = picks.iter().map(|p| (*p, cur.ts)).collect();
-    let mut live: BTreeSet<&str> = picks.iter().copied().collect();
+    let mut unchanged_since: BTreeMap<&str, u64> = picks.iter().map(|(p, _)| (*p, cur.ts)).collect();
+    let mut live: BTreeSet<&str> = picks.iter().map(|(p, _)| *p).collect();
     let history = store.list();
     let oldest = history.first().copied().unwrap_or(cur.ts);
     for ts in history.iter().rev().filter(|t| **t < cur.ts) {
@@ -640,19 +815,73 @@ pub fn compute_candidates(store: &Store, cur: &Snapshot, min: u64) -> Candidates
         });
     }
 
-    let total_bytes: u64 = picks.iter().map(|p| bytes_of(cur, p)).sum();
-    let candidates = picks
-        .iter()
-        .map(|p| {
-            let since = unchanged_since[p];
-            CandidateItem {
-                path: (*p).to_string(),
-                bytes: bytes_of(cur, p),
-                unchanged_since: since,
-                unchanged_secs: cur.ts.saturating_sub(since),
+    let mut candidates: Vec<CandidateItem> = picks
+        .into_iter()
+        .filter_map(|(p, kind)| {
+            if let Some(want) = opts.kind {
+                if kind != want {
+                    return None;
+                }
             }
+            let bytes = bytes_of(cur, p);
+            let since = unchanged_since[p];
+            let unchanged_secs = cur.ts.saturating_sub(since);
+            let last_modified = if cur.has_mtime_metadata {
+                subtree_last_modified(cur, p)
+            } else {
+                None
+            };
+            // Blend verified snapshot history with recorded directory mtime:
+            // - If a change was observed within stored history (since > oldest), active at least
+            //   as recently as `max(since, last_modified)` (never falsely claims stale).
+            // - If unchanged across all stored history (since <= oldest), use `last_modified` when
+            //   available so 30-day-old directories aren't capped at 2h of snapshot history.
+            let idle_secs = match last_modified {
+                Some(mt) if since > oldest => cur.ts.saturating_sub(since.max(mt)),
+                Some(mt) => cur.ts.saturating_sub(mt),
+                None => unchanged_secs,
+            };
+            if let Some(min_idle) = opts.older_than_secs {
+                if idle_secs < min_idle {
+                    return None;
+                }
+            }
+            let (origin, enclosing_repo) = enclosing_origin(cur, p);
+            let score = reclaim_score(bytes, idle_secs);
+            Some(CandidateItem {
+                path: p.to_string(),
+                bytes,
+                kind,
+                origin,
+                enclosing_repo,
+                unchanged_since: since,
+                unchanged_secs,
+                last_modified,
+                idle_secs,
+                score,
+            })
         })
         .collect();
+
+    match opts.sort {
+        CandidateSort::Size => candidates.sort_by(|a, b| {
+            b.bytes.cmp(&a.bytes).then_with(|| a.path.cmp(&b.path))
+        }),
+        CandidateSort::Age => candidates.sort_by(|a, b| {
+            b.idle_secs
+                .cmp(&a.idle_secs)
+                .then_with(|| b.bytes.cmp(&a.bytes))
+                .then_with(|| a.path.cmp(&b.path))
+        }),
+        CandidateSort::Score => candidates.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| b.bytes.cmp(&a.bytes))
+                .then_with(|| a.path.cmp(&b.path))
+        }),
+    }
+
+    let total_bytes: u64 = candidates.iter().map(|c| c.bytes).sum();
     let mixed = mixed
         .into_iter()
         .map(|(p, repos)| MixedItem {
@@ -664,10 +893,12 @@ pub fn compute_candidates(store: &Store, cur: &Snapshot, min: u64) -> Candidates
 
     CandidatesReport {
         ts: cur.ts,
-        min_bytes: min,
+        min_bytes: opts.min_bytes,
         history_starts: oldest,
         total_bytes,
         has_git_metadata: cur.has_git_metadata,
+        has_mtime_metadata: cur.has_mtime_metadata,
+        sort: opts.sort,
         candidates,
         mixed,
     }
@@ -675,16 +906,28 @@ pub fn compute_candidates(store: &Store, cur: &Snapshot, min: u64) -> Candidates
 
 impl CandidatesReport {
     pub fn render_json(&self, w: &mut impl Write) -> io::Result<()> {
+        let opt_u64 = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
+        let opt_str = |v: &Option<String>| {
+            v.as_deref()
+                .map(json_str)
+                .unwrap_or_else(|| "null".to_string())
+        };
         let items: Vec<String> = self
             .candidates
             .iter()
             .map(|c| {
                 format!(
-                    "{{\"path\":{},\"bytes\":{},\"unchanged_since\":{},\"unchanged_secs\":{}}}",
+                    "{{\"path\":{},\"bytes\":{},\"kind\":{},\"origin\":{},\"enclosing_repo\":{},\"unchanged_since\":{},\"unchanged_secs\":{},\"last_modified\":{},\"idle_secs\":{},\"score\":{}}}",
                     json_str(&c.path),
                     c.bytes,
+                    json_str(c.kind.as_str()),
+                    json_str(c.origin.as_str()),
+                    opt_str(&c.enclosing_repo),
                     c.unchanged_since,
-                    c.unchanged_secs
+                    c.unchanged_secs,
+                    opt_u64(c.last_modified),
+                    c.idle_secs,
+                    c.score
                 )
             })
             .collect();
@@ -704,10 +947,11 @@ impl CandidatesReport {
             .collect();
         writeln!(
             w,
-            "{{\"ts\":{},\"history_starts\":{},\"total_bytes\":{},\"candidates\":[{}],\"mixed\":[{}]}}",
+            "{{\"ts\":{},\"history_starts\":{},\"total_bytes\":{},\"sort\":{},\"candidates\":[{}],\"mixed\":[{}]}}",
             self.ts,
             self.history_starts,
             self.total_bytes,
+            json_str(self.sort.as_str()),
             items.join(","),
             mixed_items.join(",")
         )
@@ -716,19 +960,31 @@ impl CandidatesReport {
     pub fn render_human(&self, w: &mut impl Write) -> io::Result<()> {
         writeln!(
             w,
-            "{} regenerable-looking directories of at least {}, {} in total. History goes back {}.",
+            "{} regenerable-looking directories of at least {}, {} in total (sorted by {}). History goes back {}.",
             self.candidates.len(),
             human(self.min_bytes),
             human(self.total_bytes),
+            self.sort.as_str(),
             fmt_age(self.ts.saturating_sub(self.history_starts))
         )?;
-        writeln!(w, "{:>9} {:>10}  PATH", "SIZE", "UNCHANGED")?;
+        writeln!(
+            w,
+            "{:>9} {:<5} {:>8} {:<8}  PATH",
+            "SIZE", "KIND", "IDLE", "ORIGIN"
+        )?;
         for c in &self.candidates {
+            let orig = match c.origin {
+                CandidateOrigin::Worktree => "worktree",
+                CandidateOrigin::Repo => "repo",
+                CandidateOrigin::Standalone => "-",
+            };
             writeln!(
                 w,
-                "{:>9} {:>10}  {}",
+                "{:>9} {:<5} {:>8} {:<8}  {}",
                 human(c.bytes),
-                fmt_age(c.unchanged_secs),
+                c.kind.as_str(),
+                fmt_age(c.idle_secs),
+                orig,
                 c.path
             )?;
         }
@@ -750,12 +1006,18 @@ impl CandidatesReport {
                 "Note: snapshot predates git-repo metadata; run without --no-scan to check for nested git repos."
             )?;
         }
-        writeln!(w, "Matched by directory name only. Not checked: whether a process is using it, or who owns it.")
+        if !self.has_mtime_metadata {
+            writeln!(
+                w,
+                "Note: snapshot predates mtime metadata; idle times are bounded by snapshot history until next scan."
+            )?;
+        }
+        writeln!(w, "Matched by directory/cache rules only. Not checked: whether a process is using it, or who owns it.")
     }
 }
 
-pub fn candidates(store: &Store, cur: &Snapshot, min: u64, json: bool) {
-    let rep = compute_candidates(store, cur, min);
+pub fn candidates(store: &Store, cur: &Snapshot, opts: &CandidatesOpts, json: bool) {
+    let rep = compute_candidates(store, cur, opts);
     let mut out = io::stdout().lock();
     let _ = if json { rep.render_json(&mut out) } else { rep.render_human(&mut out) };
 }
