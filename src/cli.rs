@@ -39,6 +39,7 @@ OPTIONS
   --min SIZE        Smallest size or change to show, e.g. 100M, 2G
   --depth N         Levels to show in 'top' (default 4)
   --no-scan         Use the latest stored snapshot; do not look at the disk
+  --max-age DUR     Reuse the latest snapshot if newer than DUR (e.g. 60s, 5m)
   -v, --verbose     Print each directory as it is flagged
 
 Only 'scan' flags directories. Flagging cannot be undone and walks the directory once.
@@ -51,18 +52,28 @@ pub enum AgentAction {
     Print { interval: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanPolicy {
+    /// Always run a fresh read-only scan.
+    Fresh,
+    /// Never touch the disk; use the latest stored snapshot.
+    NoScan,
+    /// Reuse the latest stored snapshot if `now - latest.ts <= max_age_secs`, else scan.
+    MaxAge(u64),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
     Version,
     Init { dirs: Vec<String>, force: bool },
     Scan { dry_run: bool, full: bool, verbose: bool },
-    Diff { since: Option<String>, min: u64, no_scan: bool, json: bool },
-    Checkin { no_scan: bool },
-    Checkpoint { name: String, no_scan: bool },
+    Diff { since: Option<String>, min: u64, policy: ScanPolicy, json: bool },
+    Checkin { policy: ScanPolicy },
+    Checkpoint { name: String, policy: ScanPolicy },
     Size { paths: Vec<String>, kb: bool, json: bool },
-    Top { under: Option<String>, min: u64, depth: usize, no_scan: bool, json: bool },
-    Candidates { min: u64, no_scan: bool, json: bool },
+    Top { under: Option<String>, min: u64, depth: usize, policy: ScanPolicy, json: bool },
+    Candidates { min: u64, policy: ScanPolicy, json: bool },
     Status { json: bool },
     Doctor { json: bool },
     Agent { action: AgentAction },
@@ -133,6 +144,20 @@ fn reject_extra_pos(cmd: &str, pos: &[String], max: usize) -> Res<()> {
     }
 }
 
+fn finish_policy(no_scan: bool, max_age: Option<u64>) -> Res<ScanPolicy> {
+    match (no_scan, max_age) {
+        (true, Some(_)) => Err("--no-scan and --max-age cannot be combined".into()),
+        (true, None) => Ok(ScanPolicy::NoScan),
+        (false, Some(secs)) => Ok(ScanPolicy::MaxAge(secs)),
+        (false, None) => Ok(ScanPolicy::Fresh),
+    }
+}
+
+fn parse_max_age(val: &str) -> Res<u64> {
+    parse_duration(val)
+        .ok_or_else(|| format!("bad --max-age '{val}' (use e.g. 60s, 5m, 1h)"))
+}
+
 pub fn parse_args(raw: &[String]) -> Res<Command> {
     let Some(first) = raw.first() else {
         return Ok(Command::Help);
@@ -194,17 +219,19 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             Ok(Command::Scan { dry_run, full, verbose })
         }
         "diff" => {
-            let t = tokenize(rest, &["--since", "--min"])?;
+            let t = tokenize(rest, &["--since", "--min", "--max-age"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut since = None;
             let mut min = 100u64 << 20;
+            let mut max_age = None;
             let (mut no_scan, mut json) = (false, false);
             for (k, v) in t.opts {
                 match k.as_str() {
                     "--since" => since = Some(require_val(&k, v)?),
                     "--min" => min = parse_size(&require_val(&k, v)?)?,
+                    "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
@@ -217,44 +244,51 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                 }
             }
             reject_extra_pos("diff", &t.pos, 0)?;
-            Ok(Command::Diff { since, min, no_scan, json })
+            let policy = finish_policy(no_scan, max_age)?;
+            Ok(Command::Diff { since, min, policy, json })
         }
         "checkin" => {
-            let t = tokenize(rest, &[])?;
+            let t = tokenize(rest, &["--max-age"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut no_scan = false;
+            let mut max_age = None;
             for (k, v) in t.opts {
                 match k.as_str() {
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
                     }
+                    "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
                     _ => return Err(format!("unknown option '{k}' for 'checkin'")),
                 }
             }
             reject_extra_pos("checkin", &t.pos, 0)?;
-            Ok(Command::Checkin { no_scan })
+            let policy = finish_policy(no_scan, max_age)?;
+            Ok(Command::Checkin { policy })
         }
         "checkpoint" => {
-            let t = tokenize(rest, &[])?;
+            let t = tokenize(rest, &["--max-age"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut no_scan = false;
+            let mut max_age = None;
             for (k, v) in t.opts {
                 match k.as_str() {
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
                     }
+                    "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
                     _ => return Err(format!("unknown option '{k}' for 'checkpoint'")),
                 }
             }
             reject_extra_pos("checkpoint", &t.pos, 1)?;
             let name = t.pos.into_iter().next().ok_or("usage: diskledger checkpoint <name>")?;
-            Ok(Command::Checkpoint { name, no_scan })
+            let policy = finish_policy(no_scan, max_age)?;
+            Ok(Command::Checkpoint { name, policy })
         }
         "size" => {
             let t = tokenize(rest, &[])?;
@@ -281,12 +315,13 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             Ok(Command::Size { paths: t.pos, kb, json })
         }
         "top" => {
-            let t = tokenize(rest, &["--min", "--depth"])?;
+            let t = tokenize(rest, &["--min", "--depth", "--max-age"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut min = 1u64 << 30;
             let mut depth = 4usize;
+            let mut max_age = None;
             let (mut no_scan, mut json) = (false, false);
             for (k, v) in t.opts {
                 match k.as_str() {
@@ -295,6 +330,7 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                         let s = require_val(&k, v)?;
                         depth = s.parse().map_err(|_| "--depth needs a non-negative integer".to_string())?;
                     }
+                    "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
@@ -307,18 +343,21 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                 }
             }
             reject_extra_pos("top", &t.pos, 1)?;
-            Ok(Command::Top { under: t.pos.into_iter().next(), min, depth, no_scan, json })
+            let policy = finish_policy(no_scan, max_age)?;
+            Ok(Command::Top { under: t.pos.into_iter().next(), min, depth, policy, json })
         }
         "candidates" => {
-            let t = tokenize(rest, &["--min"])?;
+            let t = tokenize(rest, &["--min", "--max-age"])?;
             if t.help {
                 return Ok(Command::Help);
             }
             let mut min = 500u64 << 20;
+            let mut max_age = None;
             let (mut no_scan, mut json) = (false, false);
             for (k, v) in t.opts {
                 match k.as_str() {
                     "--min" => min = parse_size(&require_val(&k, v)?)?,
+                    "--max-age" => max_age = Some(parse_max_age(&require_val(&k, v)?)?),
                     "--no-scan" => {
                         require_no_val(&k, v)?;
                         no_scan = true;
@@ -331,7 +370,8 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                 }
             }
             reject_extra_pos("candidates", &t.pos, 0)?;
-            Ok(Command::Candidates { min, no_scan, json })
+            let policy = finish_policy(no_scan, max_age)?;
+            Ok(Command::Candidates { min, policy, json })
         }
         "status" => {
             let t = tokenize(rest, &[])?;
@@ -439,11 +479,11 @@ pub fn run(raw: &[String]) -> Res<()> {
     match cmd {
         Command::Init { dirs, force } => cmd_init(&store, &dirs, force),
         Command::Scan { dry_run, full, verbose } => cmd_scan(&sys, &store, dry_run, full, verbose),
-        Command::Diff { since, min, no_scan, json } => cmd_diff(&sys, &store, since.as_deref(), min, no_scan, json),
-        Command::Checkin { no_scan } => cmd_checkpoint(&sys, &store, no_scan, "checkin"),
-        Command::Checkpoint { name, no_scan } => cmd_checkpoint(&sys, &store, no_scan, &name),
-        Command::Top { under, min, depth, no_scan, json } => cmd_top(&sys, &store, under.as_deref(), min, depth, no_scan, json),
-        Command::Candidates { min, no_scan, json } => cmd_candidates(&sys, &store, min, no_scan, json),
+        Command::Diff { since, min, policy, json } => cmd_diff(&sys, &store, since.as_deref(), min, policy, json),
+        Command::Checkin { policy } => cmd_checkpoint(&sys, &store, policy, "checkin"),
+        Command::Checkpoint { name, policy } => cmd_checkpoint(&sys, &store, policy, &name),
+        Command::Top { under, min, depth, policy, json } => cmd_top(&sys, &store, under.as_deref(), min, depth, policy, json),
+        Command::Candidates { min, policy, json } => cmd_candidates(&sys, &store, min, policy, json),
         Command::Status { json } => cmd_status(&store, json),
         Command::Doctor { json } => cmd_doctor(&store, json),
         Command::Agent { action } => cmd_agent(&store, action),
@@ -538,10 +578,30 @@ fn cmd_scan(sys: &dyn System, store: &Store, dry: bool, full: bool, verbose: boo
     Ok(())
 }
 
-/// The snapshot to report on: the latest stored one with --no-scan, else a fresh read-only scan.
-fn current(sys: &dyn System, store: &Store, no_scan: bool, json: bool) -> Res<Snapshot> {
-    if no_scan {
-        return store.latest().ok_or_else(|| "no snapshots yet. Run: diskledger scan".to_string());
+/// The snapshot to report on according to `policy`: `--no-scan` always uses the latest
+/// stored snapshot, `--max-age` reuses it when fresh enough, else runs a fresh read-only scan.
+pub fn current_with(
+    sys: &dyn System,
+    store: &Store,
+    policy: ScanPolicy,
+    json: bool,
+) -> Res<Snapshot> {
+    match policy {
+        ScanPolicy::NoScan => {
+            return store.latest().ok_or_else(|| "no snapshots yet. Run: diskledger scan".to_string());
+        }
+        ScanPolicy::MaxAge(max_age) => {
+            if let Some(latest) = store.latest() {
+                let age = sys.now().saturating_sub(latest.ts);
+                if age <= max_age {
+                    if !json {
+                        eprintln!("reusing snapshot from {} ago (within --max-age)", fmt_age(age));
+                    }
+                    return Ok(latest);
+                }
+            }
+        }
+        ScanPolicy::Fresh => {}
     }
     let cfg = store.config()?;
     let rep = fresh_scan_with(sys, store, &cfg, false, false, false)?;
@@ -583,15 +643,15 @@ pub fn resolve_since_at(store: &Store, since: Option<&str>, cur_ts: u64, now_ts:
     store.load(ts)
 }
 
-fn cmd_diff(sys: &dyn System, store: &Store, since: Option<&str>, min: u64, no_scan: bool, json: bool) -> Res<()> {
-    let cur = current(sys, store, no_scan, json)?;
+fn cmd_diff(sys: &dyn System, store: &Store, since: Option<&str>, min: u64, policy: ScanPolicy, json: bool) -> Res<()> {
+    let cur = current_with(sys, store, policy, json)?;
     let base = resolve_since_at(store, since, cur.ts, sys.now())?;
     report::diff(&base, &cur, min, json);
     Ok(())
 }
 
-fn cmd_checkpoint(sys: &dyn System, store: &Store, no_scan: bool, name: &str) -> Res<()> {
-    let cur = current(sys, store, no_scan, false)?;
+fn cmd_checkpoint(sys: &dyn System, store: &Store, policy: ScanPolicy, name: &str) -> Res<()> {
+    let cur = current_with(sys, store, policy, false)?;
     if !store.list().contains(&cur.ts) {
         return Err("could not store the snapshot, so no checkpoint was saved".into());
     }
@@ -606,13 +666,13 @@ fn cmd_top(
     under: Option<&str>,
     min: u64,
     depth: usize,
-    no_scan: bool,
+    policy: ScanPolicy,
     json: bool,
 ) -> Res<()> {
-    let cur = current(sys, store, no_scan, json)?;
+    let cur = current_with(sys, store, policy, json)?;
     let under = match under {
         Some(p) => {
-            let resolved = if no_scan {
+            let resolved = if matches!(policy, ScanPolicy::NoScan) {
                 normalize_path_str(p)
             } else {
                 normalize_path_str(&store::canonical(&PathBuf::from(p))?.to_string_lossy())
@@ -632,8 +692,8 @@ fn cmd_top(
     Ok(())
 }
 
-fn cmd_candidates(sys: &dyn System, store: &Store, min: u64, no_scan: bool, json: bool) -> Res<()> {
-    let cur = current(sys, store, no_scan, json)?;
+fn cmd_candidates(sys: &dyn System, store: &Store, min: u64, policy: ScanPolicy, json: bool) -> Res<()> {
+    let cur = current_with(sys, store, policy, json)?;
     report::candidates(store, &cur, min, json);
     Ok(())
 }
