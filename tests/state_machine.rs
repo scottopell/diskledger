@@ -4,10 +4,13 @@
 
 use diskledger::cli::{current_with, fresh_scan_with, resolve_since_at, ScanPolicy};
 use diskledger::kstat::{DirStat, VolumeInfo};
-use diskledger::report::{compute_candidates, compute_diff, compute_top, DiffStatus};
+use diskledger::report::{
+    compute_candidates, compute_diff, compute_size_children, compute_top, DiffStatus,
+    MonitoredState, SizeChildrenOpts,
+};
 use diskledger::scan::{self, ScanOpts};
 use diskledger::store::{Config, Snapshot, Store};
-use diskledger::sys::{DirListing, System};
+use diskledger::sys::{DirListing, DirectEntry, System};
 use diskledger::util::{is_same_or_under, is_under, normalize_path_str, parent_of};
 use proptest::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
@@ -462,6 +465,55 @@ impl System for FakeFs {
             }
         }
         Ok(DirListing { subdirs, too_many_children: false, has_git, has_direct_files })
+    }
+
+    fn list_entries(&self, path: &Path) -> io::Result<Vec<DirectEntry>> {
+        let p = normalize_path_str(&path.to_string_lossy());
+        self.ops.lock().unwrap().list_dirs += 1;
+        let st = self.state.lock().unwrap();
+        let d = st
+            .dirs
+            .get(&p)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such directory"))?;
+        if d.unreadable {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied"));
+        }
+        let parent_dev = d.dev;
+        let mut out = Vec::new();
+        for (k, info) in &st.dirs {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: true,
+                    is_symlink: false,
+                    dev: info.dev,
+                    file_bytes: 0,
+                });
+            }
+        }
+        for (k, &bytes) in &st.files {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: false,
+                    is_symlink: false,
+                    dev: parent_dev,
+                    file_bytes: bytes,
+                });
+            }
+        }
+        for k in st.symlinks.keys() {
+            if parent_of(k) == Some(p.as_str()) {
+                out.push(DirectEntry {
+                    path: PathBuf::from(k),
+                    is_dir: false,
+                    is_symlink: true,
+                    dev: parent_dev,
+                    file_bytes: 0,
+                });
+            }
+        }
+        Ok(out)
     }
 
     fn has_git(&self, path: &Path) -> bool {
@@ -1539,5 +1591,116 @@ proptest! {
         let fresh = current_with(&fs, &store, ScanPolicy::MaxAge(max_age), true).unwrap();
         prop_assert!(fs.ops_total() > ops_before2, "--max-age miss must run a fresh scan");
         prop_assert!(fresh.ts > s1.ts);
+    }
+
+    /// `size --children` / `--unmonitored` invariants:
+    /// - Strictly sorted descending by shown bytes
+    /// - Monitored roots are skipped with ZERO walks under `--unmonitored`
+    /// - Partial parents (like `~/Library` containing `~/Library/Caches`) subtract
+    ///   monitored descendants accurately
+    /// - `sum(entries) + omitted_bytes == total_bytes`, never crosses volumes, never calls flag()
+    #[test]
+    fn size_children_sorting_partial_subtraction_and_zero_walk_skip(
+        mon_bytes in (10u64 << 20)..(100u64 << 20),
+        partial_mon_bytes in (10u64 << 20)..(80u64 << 20),
+        partial_unmon_bytes in (5u64 << 20)..(80u64 << 20),
+        unmon_sizes in prop::collection::vec(0u64..(60u64 << 20), 1..=8),
+        file_bytes in 0u64..(20u64 << 20),
+        min_bytes in prop_oneof![Just(0u64), Just(10u64 << 20), Just(30u64 << 20)],
+        limit in prop_oneof![Just(None), (1usize..=5).prop_map(Some)],
+    ) {
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/home", 1);
+        // 1. Fully monitored root (intentionally unflagged so any query would increment walks!)
+        fs.mkdir("/home/dev", 1);
+        fs.write_file("/home/dev/blob.bin", mon_bytes);
+        // 2. Partial parent: /home/Library has monitored /home/Library/Caches + unmonitored AppSupport
+        fs.mkdir("/home/Library", 1);
+        fs.mkdir("/home/Library/Caches", 1);
+        fs.write_file("/home/Library/Caches/c.bin", partial_mon_bytes);
+        fs.flag(Path::new("/home/Library/Caches")).unwrap();
+        fs.mkdir("/home/Library/AppSupport", 1);
+        fs.write_file("/home/Library/AppSupport/a.bin", partial_unmon_bytes);
+        // 3. Pure unmonitored sibling dirs
+        for (i, &sz) in unmon_sizes.iter().enumerate() {
+            let d = format!("/home/unmon_{i}");
+            fs.mkdir(&d, 1);
+            fs.write_file(&format!("{d}/f.bin"), sz);
+        }
+        // 4. Direct file + cross-dev mount (must be ignored)
+        fs.write_file("/home/direct.bin", file_bytes);
+        fs.mkdir("/home/external_vol", 2);
+        fs.write_file("/home/external_vol/huge.bin", 999 << 20);
+
+        let roots = vec!["/home/dev".to_string(), "/home/Library/Caches".to_string()];
+
+        // Full children mode
+        let ops0 = fs.ops_snapshot();
+        let all = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes, limit, unmonitored_only: false },
+        )
+        .unwrap();
+        let ops1 = fs.ops_snapshot();
+        prop_assert_eq!(ops1.flags, ops0.flags, "size -c must never flag");
+        prop_assert!(
+            all.entries.iter().all(|e| e.path != "/home/external_vol"),
+            "size -c must not cross volumes"
+        );
+        let kept_sum: u64 = all.entries.iter().map(|e| e.bytes).sum();
+        prop_assert_eq!(kept_sum + all.omitted_bytes, all.total_bytes);
+        for w in all.entries.windows(2) {
+            prop_assert!(w[0].bytes >= w[1].bytes, "not sorted descending");
+        }
+        let mut jbuf = Vec::new();
+        all.render_json(&mut jbuf).unwrap();
+        assert_json_valid(&jbuf, "size -c json");
+        let mut hbuf = Vec::new();
+        all.render_human(&mut hbuf).unwrap();
+
+        // Unmonitored-only mode: MUST skip /home/dev without walking it, and report
+        // exact unmonitored_bytes for /home/Library!
+        let unmon_all = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes: 0, limit: None, unmonitored_only: true },
+        )
+        .unwrap();
+        prop_assert!(unmon_all.entries.iter().all(|e| e.path != "/home/dev"));
+        let lib = unmon_all
+            .entries
+            .iter()
+            .find(|e| e.path == "/home/Library")
+            .expect("/home/Library must appear");
+        prop_assert_eq!(lib.monitored, MonitoredState::Partial);
+        prop_assert_eq!(lib.bytes, partial_mon_bytes + partial_unmon_bytes);
+        prop_assert_eq!(lib.unmonitored_bytes, partial_unmon_bytes);
+
+        let expected_unmon_total: u64 =
+            partial_unmon_bytes + unmon_sizes.iter().sum::<u64>() + file_bytes;
+        prop_assert_eq!(unmon_all.total_bytes, expected_unmon_total);
+
+        // Verify covered dir `/home/dev` is skipped with 0 walks when every other dir is flagged.
+        fs.flag(Path::new("/home/Library")).unwrap();
+        for i in 0..unmon_sizes.len() {
+            fs.flag(Path::new(&format!("/home/unmon_{i}"))).unwrap();
+        }
+        let pre = fs.ops_snapshot();
+        let _ = compute_size_children(
+            &fs,
+            Path::new("/home"),
+            &roots,
+            &SizeChildrenOpts { min_bytes, limit, unmonitored_only: true },
+        )
+        .unwrap();
+        let post = fs.ops_snapshot();
+        prop_assert_eq!(
+            post.walks - pre.walks,
+            0,
+            "size -c -u must not walk covered root /home/dev"
+        );
     }
 }

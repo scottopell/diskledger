@@ -23,8 +23,13 @@ USAGE
                                     'checkin' checkpoint, else the previous snapshot.
   diskledger checkin                Mark now as the baseline for the next plain 'diff'
   diskledger checkpoint <name>      Save a named baseline
-  diskledger size <path>...         Size of any path right now, like 'du -s'. Instant for
+  diskledger size [-c] [-u] <path>...
+                                    Size of any path right now, like 'du -s'. Instant for
                                     flagged directories; otherwise the kernel walks it.
+                                    -c, --children lists immediate children sorted largest-first
+                                    (including dotfiles) and marks monitored roots.
+                                    -u, --unmonitored (with -c) skips monitored folders and
+                                    subtracts monitored subtrees from partial parents.
                                     -k prints 'KiB<TAB>path', the same as 'du -sk'.
   diskledger top [dir]              Largest directories in the latest snapshot
   diskledger candidates             Regenerable-looking directories (target, node_modules, ...)
@@ -37,6 +42,7 @@ USAGE
 OPTIONS
   --json            Machine-readable output (diff, size, top, candidates, status, doctor)
   --min SIZE        Smallest size or change to show, e.g. 100M, 2G
+  --limit N         Maximum rows to show in 'size -c'
   --depth N         Levels to show in 'top' (default 4)
   --no-scan         Use the latest stored snapshot; do not look at the disk
   --max-age DUR     Reuse the latest snapshot if newer than DUR (e.g. 60s, 5m)
@@ -71,7 +77,15 @@ pub enum Command {
     Diff { since: Option<String>, min: u64, policy: ScanPolicy, json: bool },
     Checkin { policy: ScanPolicy },
     Checkpoint { name: String, policy: ScanPolicy },
-    Size { paths: Vec<String>, kb: bool, json: bool },
+    Size {
+        paths: Vec<String>,
+        children: bool,
+        unmonitored: bool,
+        min: u64,
+        limit: Option<usize>,
+        kb: bool,
+        json: bool,
+    },
     Top { under: Option<String>, min: u64, depth: usize, policy: ScanPolicy, json: bool },
     Candidates { min: u64, policy: ScanPolicy, json: bool },
     Status { json: bool },
@@ -291,11 +305,13 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             Ok(Command::Checkpoint { name, policy })
         }
         "size" => {
-            let t = tokenize(rest, &[])?;
+            let t = tokenize(rest, &["--min", "--limit"])?;
             if t.help {
                 return Ok(Command::Help);
             }
-            let (mut kb, mut json) = (false, false);
+            let (mut kb, mut json, mut children, mut unmonitored) = (false, false, false, false);
+            let mut min: Option<u64> = None;
+            let mut limit: Option<usize> = None;
             for (k, v) in t.opts {
                 match k.as_str() {
                     "-k" | "--kb" => {
@@ -306,13 +322,41 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
                         require_no_val(&k, v)?;
                         json = true;
                     }
+                    "-c" | "--children" => {
+                        require_no_val(&k, v)?;
+                        children = true;
+                    }
+                    "-u" | "--unmonitored" => {
+                        require_no_val(&k, v)?;
+                        unmonitored = true;
+                    }
+                    "--min" => min = Some(parse_size(&require_val(&k, v)?)?),
+                    "--limit" => {
+                        let s = require_val(&k, v)?;
+                        let n: usize = s.parse().map_err(|_| "--limit needs a non-negative integer".to_string())?;
+                        limit = if n == 0 { None } else { Some(n) };
+                    }
                     _ => return Err(format!("unknown option '{k}' for 'size'")),
                 }
             }
-            if t.pos.is_empty() {
-                return Err("usage: diskledger size [-k] [--json] <path>...".into());
+            if !children && (unmonitored || min.is_some() || limit.is_some()) {
+                return Err("--unmonitored, --min, and --limit require --children (-c)".into());
             }
-            Ok(Command::Size { paths: t.pos, kb, json })
+            if t.pos.is_empty() {
+                return Err("usage: diskledger size [-c] [-u] [-k] [--json] <path>...".into());
+            }
+            if children && t.pos.len() > 1 {
+                return Err("usage: diskledger size -c [-u] [--min SIZE] [--limit N] <dir>".into());
+            }
+            Ok(Command::Size {
+                paths: t.pos,
+                children,
+                unmonitored,
+                min: min.unwrap_or(0),
+                limit,
+                kb,
+                json,
+            })
         }
         "top" => {
             let t = tokenize(rest, &["--min", "--depth", "--max-age"])?;
@@ -470,7 +514,40 @@ pub fn run(raw: &[String]) -> Res<()> {
             println!("diskledger {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        Command::Size { paths, kb, json } => return cmd_size(&paths, kb, json),
+        Command::Size { paths, children, unmonitored, min, limit, kb, json } => {
+            if children {
+                let roots = Store::open()
+                    .ok()
+                    .and_then(|st| st.config().ok())
+                    .map(|c| {
+                        c.roots
+                            .into_iter()
+                            .map(|r| normalize_path_str(&r.to_string_lossy()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let dir = store::canonical(&PathBuf::from(&paths[0]))?;
+                let opts = report::SizeChildrenOpts {
+                    min_bytes: min,
+                    limit,
+                    unmonitored_only: unmonitored,
+                };
+                let rep = report::compute_size_children(&RealSystem, &dir, &roots, &opts)?;
+                let mut out = io::stdout().lock();
+                let _ = if json {
+                    rep.render_json(&mut out)
+                } else if kb {
+                    rep.render_kb(&mut out)
+                } else {
+                    rep.render_human(&mut out)
+                };
+                for e in &rep.errors {
+                    eprintln!("diskledger: {e}");
+                }
+                return Ok(());
+            }
+            return cmd_size(&paths, kb, json);
+        }
         _ => {}
     }
 
