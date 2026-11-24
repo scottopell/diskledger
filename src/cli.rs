@@ -12,6 +12,8 @@ diskledger: what grew, what shrank, and what could be freed (macOS / APFS)
 
 USAGE
   diskledger init <dir>...          Create the config with these monitored directories
+  diskledger root list|add|remove [dir...]
+                                    List, add, or remove monitored directories in the config
   diskledger scan [--dry-run] [--full]
                                     Record sizes and flag large directories for instant
                                     kernel totals. This is what the periodic job runs.
@@ -40,7 +42,7 @@ USAGE
   diskledger --version
 
 OPTIONS
-  --json            Machine-readable output (diff, size, top, candidates, status, doctor)
+  --json            Machine-readable output (diff, size, top, candidates, status, root, doctor)
   --min SIZE        Smallest size or change to show, e.g. 100M, 2G
   --limit N         Maximum rows to show in 'size -c'
   --depth N         Levels to show in 'top' (default 4)
@@ -50,6 +52,13 @@ OPTIONS
 
 Only 'scan' flags directories. Flagging cannot be undone and walks the directory once.
 State lives in $DISKLEDGER_HOME (default ~/.diskledger).";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootAction {
+    List { json: bool },
+    Add { dirs: Vec<String> },
+    Remove { dirs: Vec<String> },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
@@ -90,6 +99,7 @@ pub enum Command {
     Candidates { min: u64, policy: ScanPolicy, json: bool },
     Status { json: bool },
     Doctor { json: bool },
+    Root { action: RootAction },
     Agent { action: AgentAction },
 }
 
@@ -453,6 +463,53 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
             reject_extra_pos("doctor", &t.pos, 0)?;
             Ok(Command::Doctor { json })
         }
+        "root" => {
+            let t = tokenize(rest, &[])?;
+            if t.help {
+                return Ok(Command::Help);
+            }
+            let mut json = false;
+            for (k, v) in t.opts {
+                match k.as_str() {
+                    "--json" => {
+                        require_no_val(&k, v)?;
+                        json = true;
+                    }
+                    _ => return Err(format!("unknown option '{k}' for 'root'")),
+                }
+            }
+            let mut pos = t.pos.into_iter();
+            let action_str = pos.next().unwrap_or_default();
+            let dirs: Vec<String> = pos.collect();
+            let action = match action_str.as_str() {
+                "list" => {
+                    if !dirs.is_empty() {
+                        return Err(format!("unexpected argument '{}' for 'root list'", dirs[0]));
+                    }
+                    RootAction::List { json }
+                }
+                "add" => {
+                    if json {
+                        return Err("--json is only valid for 'root list'".into());
+                    }
+                    if dirs.is_empty() {
+                        return Err("usage: diskledger root add <dir>...".into());
+                    }
+                    RootAction::Add { dirs }
+                }
+                "remove" => {
+                    if json {
+                        return Err("--json is only valid for 'root list'".into());
+                    }
+                    if dirs.is_empty() {
+                        return Err("usage: diskledger root remove <dir>...".into());
+                    }
+                    RootAction::Remove { dirs }
+                }
+                _ => return Err("usage: diskledger root list|add|remove [dir...]".into()),
+            };
+            Ok(Command::Root { action })
+        }
         "agent" => {
             let t = tokenize(rest, &["--interval"])?;
             if t.help {
@@ -563,6 +620,7 @@ pub fn run(raw: &[String]) -> Res<()> {
         Command::Candidates { min, policy, json } => cmd_candidates(&sys, &store, min, policy, json),
         Command::Status { json } => cmd_status(&store, json),
         Command::Doctor { json } => cmd_doctor(&store, json),
+        Command::Root { action } => cmd_root(&sys, &store, action),
         Command::Agent { action } => cmd_agent(&store, action),
         Command::Help | Command::Version | Command::Size { .. } => unreachable!(),
     }
@@ -882,6 +940,121 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
         }
     }
     Ok(())
+}
+
+/// Add validated APFS directories to the configured roots (never flags).
+pub fn add_roots_with(sys: &dyn System, store: &Store, paths: &[PathBuf]) -> Res<Vec<String>> {
+    if paths.is_empty() {
+        return Err("usage: diskledger root add <dir>...".into());
+    }
+    let mut cfg = store.config()?;
+    let mut added = Vec::with_capacity(paths.len());
+    for p in paths {
+        let key = normalize_path_str(&p.to_string_lossy());
+        match sys.dir_dev(p) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err(format!("{key}: not a directory")),
+            Err(e) => return Err(format!("{key}: {e}")),
+        }
+        sys.query(p).map_err(|e| {
+            format!("{key}: kernel dir-stats unavailable ({e}). Is this an APFS volume?")
+        })?;
+        cfg.roots.push(PathBuf::from(&key));
+        added.push(key);
+    }
+    cfg.validate()?;
+    store.write_config(&cfg)?;
+    Ok(added)
+}
+
+/// Remove roots from the config (allows removing paths that no longer exist on disk).
+pub fn remove_roots_with(store: &Store, paths: &[String]) -> Res<Vec<String>> {
+    if paths.is_empty() {
+        return Err("usage: diskledger root remove <dir>...".into());
+    }
+    let mut cfg = store.config()?;
+    let mut removed = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let norm = normalize_path_str(raw);
+        let canon = std::fs::canonicalize(raw)
+            .ok()
+            .map(|p| normalize_path_str(&p.to_string_lossy()));
+        let idx = cfg.roots.iter().position(|r| {
+            let rk = normalize_path_str(&r.to_string_lossy());
+            rk == norm || canon.as_deref() == Some(rk.as_str())
+        });
+        let Some(i) = idx else {
+            return Err(format!("'{norm}' is not a monitored root"));
+        };
+        let gone = normalize_path_str(&cfg.roots.remove(i).to_string_lossy());
+        removed.push(gone);
+    }
+    if cfg.roots.is_empty() {
+        return Err("cannot remove the last monitored root".into());
+    }
+    cfg.validate()?;
+    store.write_config(&cfg)?;
+    Ok(removed)
+}
+
+fn cmd_root(sys: &dyn System, store: &Store, action: RootAction) -> Res<()> {
+    match action {
+        RootAction::List { json } => {
+            let cfg = store.config()?;
+            let latest = store.latest();
+            if json {
+                let items: Vec<String> = cfg
+                    .roots
+                    .iter()
+                    .map(|r| {
+                        let k = r.to_string_lossy();
+                        let row = latest.as_ref().and_then(|s| s.rows.get(k.as_ref()));
+                        format!(
+                            "{{\"path\":{},\"bytes\":{},\"flagged\":{}}}",
+                            json_str(&k),
+                            row.map_or(0, |r| r.bytes),
+                            row.map_or(false, |r| r.flagged)
+                        )
+                    })
+                    .collect();
+                println!("[{}]", items.join(","));
+                return Ok(());
+            }
+            for r in &cfg.roots {
+                let k = r.to_string_lossy();
+                match latest.as_ref().and_then(|s| s.rows.get(k.as_ref())) {
+                    Some(row) => println!(
+                        "{:>9}  {}{}",
+                        human(row.bytes),
+                        k,
+                        if row.flagged { " *" } else { "  (not flagged)" }
+                    ),
+                    None => println!("{:>9}  {}  (not scanned yet)", "?", k),
+                }
+            }
+            Ok(())
+        }
+        RootAction::Add { dirs } => {
+            let mut canon = Vec::with_capacity(dirs.len());
+            for d in &dirs {
+                canon.push(store::canonical(&PathBuf::from(d))?);
+            }
+            let added = add_roots_with(sys, store, &canon)?;
+            for p in &added {
+                println!("Added root {p}");
+            }
+            println!("Nothing has been flagged yet. Preview with: diskledger scan --dry-run");
+            Ok(())
+        }
+        RootAction::Remove { dirs } => {
+            let removed = remove_roots_with(store, &dirs)?;
+            for p in &removed {
+                println!("Removed root {p}");
+            }
+            println!("Existing snapshots keep their history; future diffs will list removed roots as no longer monitored.");
+            Ok(())
+        }
+    }
 }
 
 fn cmd_doctor(store: &Store, json: bool) -> Res<()> {

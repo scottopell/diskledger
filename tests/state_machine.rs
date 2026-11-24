@@ -2,7 +2,9 @@
 //! scan, store, prune, checkpoint, diff, top, and candidates logic against an
 //! in-memory APFS filesystem simulator (`FakeFs`) and virtual clock.
 
-use diskledger::cli::{current_with, fresh_scan_with, resolve_since_at, ScanPolicy};
+use diskledger::cli::{
+    add_roots_with, current_with, fresh_scan_with, remove_roots_with, resolve_since_at, ScanPolicy,
+};
 use diskledger::kstat::{DirStat, VolumeInfo};
 use diskledger::report::{
     compute_candidates, compute_diff, compute_size_children, compute_top, DiffStatus,
@@ -1702,5 +1704,68 @@ proptest! {
             0,
             "size -c -u must not walk covered root /home/dev"
         );
+    }
+
+    /// `root add` / `root remove` invariants:
+    /// - Adding valid disjoint roots persists atomically and never calls `flag()`
+    /// - Adding duplicates, nested overlaps, or non-directories fails leaving config untouched
+    /// - Removing existing or even already-deleted roots works cleanly; removing the last root fails
+    #[test]
+    fn root_add_remove_invariants(
+        extra_names in prop::collection::btree_set("[a-z]{2,8}", 2..=5),
+        delete_before_remove in any::<bool>(),
+    ) {
+        let home = TempHome::new("roots");
+        let store = Store::open_at(home.0.clone());
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/vol", 1);
+        fs.mkdir("/vol/base", 1);
+        let init_cfg = Config {
+            roots: vec![PathBuf::from("/vol/base")],
+            ..Config::default()
+        };
+        store.write_config(&init_cfg).unwrap();
+
+        let paths: Vec<PathBuf> = extra_names
+            .iter()
+            .map(|n| {
+                let p = format!("/vol/{n}");
+                fs.mkdir(&p, 1);
+                PathBuf::from(p)
+            })
+            .collect();
+
+        let ops0 = fs.ops_snapshot();
+        let added = add_roots_with(&fs, &store, &paths).unwrap();
+        let ops1 = fs.ops_snapshot();
+        prop_assert_eq!(ops1.flags, ops0.flags, "root add must NEVER flag");
+        prop_assert_eq!(added.len(), paths.len());
+
+        // Duplicate root rejected without mutating config.
+        let before_dup = store.config().unwrap();
+        prop_assert!(add_roots_with(&fs, &store, &[paths[0].clone()]).is_err());
+        prop_assert_eq!(&store.config().unwrap(), &before_dup);
+
+        // Overlapping nested child rejected without mutating config.
+        let nested = PathBuf::from(format!("{}/child", paths[0].display()));
+        fs.mkdir(&nested.to_string_lossy(), 1);
+        prop_assert!(add_roots_with(&fs, &store, &[nested]).is_err());
+        prop_assert_eq!(&store.config().unwrap(), &before_dup);
+
+        // Removing all added roots succeeds even if one was already deleted from disk.
+        if delete_before_remove {
+            fs.delete_dir_tree(&paths[0].to_string_lossy());
+        }
+        let rm_args: Vec<String> = paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let removed = remove_roots_with(&store, &rm_args).unwrap();
+        prop_assert_eq!(removed.len(), paths.len());
+        prop_assert_eq!(store.config().unwrap().roots, vec![PathBuf::from("/vol/base")]);
+
+        // Removing the last remaining root must error and preserve config.
+        prop_assert!(remove_roots_with(&store, &["/vol/base".to_string()]).is_err());
+        prop_assert_eq!(store.config().unwrap().roots, vec![PathBuf::from("/vol/base")]);
     }
 }

@@ -1,7 +1,7 @@
 //! Property tests for typed CLI parsing, encoding/parsing primitives,
 //! `apfs.util -S` output parsing, config validation, and snapshot corruption checks.
 
-use diskledger::cli::{parse_args, AgentAction, Command, ScanPolicy};
+use diskledger::cli::{parse_args, AgentAction, Command, RootAction, ScanPolicy};
 use diskledger::kstat::{parse_apfs_util_s, DirStat};
 use diskledger::store::{Config, Row, Snapshot, Store};
 use diskledger::util::{
@@ -291,6 +291,34 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
             }
             (Command::Doctor { json }, argv)
         }),
+        // root
+        prop_oneof![
+            any::<bool>().prop_map(|json| {
+                let mut argv = vec!["root".to_string(), "list".to_string()];
+                if json {
+                    argv.push("--json".into());
+                }
+                (Command::Root { action: RootAction::List { json } }, argv)
+            }),
+            (prop::collection::vec(safe_path(), 1..=3), any::<bool>()).prop_map(
+                |(dirs, is_add)| {
+                    let mut argv = vec![
+                        "root".to_string(),
+                        if is_add { "add" } else { "remove" }.to_string(),
+                    ];
+                    if dirs.iter().any(|d| d.starts_with('-')) {
+                        argv.push("--".into());
+                    }
+                    argv.extend(dirs.clone());
+                    let action = if is_add {
+                        RootAction::Add { dirs }
+                    } else {
+                        RootAction::Remove { dirs }
+                    };
+                    (Command::Root { action }, argv)
+                }
+            ),
+        ],
         // agent
         prop_oneof![
             (proptest::option::of(60u64..86400), any::<bool>(), any::<bool>()).prop_map(

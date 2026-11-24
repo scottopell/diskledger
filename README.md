@@ -32,29 +32,35 @@ diskledger diff                # what changed since the last checkin
 | Command | What it does | Changes the disk? |
 |---|---|---|
 | `init <dir>...` | Write the config with these monitored directories | Config only |
+| `root list\|add\|remove` | List, add, or remove monitored directories in the config | Config only |
 | `scan` | Record sizes; flag large directories | Flags directories |
 | `scan --dry-run` | Same, but only list what would be flagged | No |
 | `scan --full` | Re-examine every directory, ignoring the previous snapshot | Flags directories |
 | `diff [--since X]` | Changes since a checkpoint, an age (`2h`, `3d`) or a timestamp | Snapshot only |
 | `checkin` | Baseline for the next plain `diff` | Snapshot only |
 | `checkpoint <name>` | Named baseline | Snapshot only |
-| `size <path>...` | Size of any path right now; `-k` prints exactly what `du -sk` prints | No |
+| `size <path>...` | Size of any path right now; `-c` sorts immediate children, `-u` focuses on unmonitored space, `-k` matches `du -sk` | No |
 | `top [dir]` | Largest directories | Snapshot only |
 | `candidates` | Directories named like build output, with how long unchanged | Snapshot only |
-| `status` | Free space, roots, snapshots, checkpoints | No |
+| `status` | Free space (including APFS purgeable, sibling container volumes, local snapshots), roots, snapshots, checkpoints | No |
 | `doctor` | Verify the private APFS `fsctl` ABI against `apfs.util -S` | Temp dir only |
 | `agent install` | Run `scan` every 15 minutes through launchd | Installs a LaunchAgent |
 
-Add `--json` to `diff`, `size`, `top`, `candidates`, `status` and `doctor` for agents.
+Add `--json` to `diff`, `size`, `top`, `candidates`, `status`, `root list` and `doctor` for agents.
 
 `size` needs no config and works on any path, monitored or not. On a flagged
 directory it answers from the kernel record; elsewhere the kernel walks the
-subtree, which is still several times faster than `du`.
+subtree, which is still several times faster than `du`. Use `size -c <dir>` to
+list immediate children (including dotfiles) sorted largest-first in parallel, or
+`size -c -u ~` to skip already-monitored folders and subtract monitored subtrees
+from partial parents like `~/Library`.
 
 `diff` ends with how much of the free-space change the monitored folders
 account for and how much happened elsewhere on the volume (`outside_delta`
-in JSON). A large "elsewhere" figure means something outside the monitored
-folders grew or shrank.
+in JSON, split into `unmonitored_volume_delta` vs `other_volumes_delta` for
+sibling APFS container volumes like VM swap, plus `purgeable_delta` and local
+APFS snapshot counts). A large unmonitored figure points to `size -c ~` or
+`root add <path>`.
 Add `--no-scan` to report from the latest stored snapshot without touching the
 disk, or `--max-age 5m` to reuse a recent background scan when fresh enough.
 
