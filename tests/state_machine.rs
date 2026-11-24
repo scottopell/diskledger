@@ -2,7 +2,7 @@
 //! scan, store, prune, checkpoint, diff, top, and candidates logic against an
 //! in-memory APFS filesystem simulator (`FakeFs`) and virtual clock.
 
-use diskledger::cli::{fresh_scan_with, resolve_since_at};
+use diskledger::cli::{current_with, fresh_scan_with, resolve_since_at, ScanPolicy};
 use diskledger::kstat::DirStat;
 use diskledger::report::{compute_candidates, compute_diff, compute_top, DiffStatus};
 use diskledger::scan::{self, ScanOpts};
@@ -1405,5 +1405,47 @@ proptest! {
         let full = scan::run(&fs, &cfg, None, &ScanOpts { flag: false, verbose: false });
         prop_assert_eq!(rep.snapshot.rows, full.snapshot.rows);
         prop_assert_eq!(rep.would_flag, full.would_flag);
+    }
+
+    /// `--max-age` reuses the latest snapshot with zero filesystem calls when
+    /// `now - latest.ts <= max_age`, and triggers a fresh read-only scan once older.
+    #[test]
+    fn max_age_reuses_fresh_snapshot_with_zero_fs_ops(
+        max_age in 10u64..3600,
+        within_frac in 0u64..=100,
+        over_delta in 1u64..3600,
+    ) {
+        let home = TempHome::new("maxage");
+        let store = Store::open_at(home.0.clone());
+        let fs = FakeFs::new(1_795_000_000);
+        fs.mkdir("/vol", 1);
+        fs.mkdir("/vol/r", 1);
+        fs.write_file("/vol/r/f.bin", 80 << 20);
+        let cfg = Config {
+            roots: vec![PathBuf::from("/vol/r")],
+            flag_min_entries: 5_000,
+            record_min_bytes: 64 << 20,
+            max_depth: 6,
+            max_children: 64,
+            keep_snapshots: 5,
+        };
+        store.write_config(&cfg).unwrap();
+
+        let s1 = fresh_scan_with(&fs, &store, &cfg, false, false, false).unwrap().snapshot;
+
+        // Advance time within `max_age` -> MUST reuse s1 with ZERO fs calls.
+        let dt_in = (max_age * within_frac) / 100;
+        fs.advance_time(dt_in);
+        let ops_before = fs.ops_total();
+        let reused = current_with(&fs, &store, ScanPolicy::MaxAge(max_age), true).unwrap();
+        prop_assert_eq!(fs.ops_total(), ops_before, "--max-age hit must touch 0 fs ops");
+        prop_assert_eq!(reused.ts, s1.ts);
+
+        // Advance past `max_age` -> MUST run a fresh read-only scan.
+        fs.advance_time(max_age - dt_in + over_delta);
+        let ops_before2 = fs.ops_total();
+        let fresh = current_with(&fs, &store, ScanPolicy::MaxAge(max_age), true).unwrap();
+        prop_assert!(fs.ops_total() > ops_before2, "--max-age miss must run a fresh scan");
+        prop_assert!(fresh.ts > s1.ts);
     }
 }

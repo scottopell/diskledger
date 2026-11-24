@@ -1,7 +1,7 @@
 //! Property tests for typed CLI parsing, encoding/parsing primitives,
 //! `apfs.util -S` output parsing, config validation, and snapshot corruption checks.
 
-use diskledger::cli::{parse_args, AgentAction, Command};
+use diskledger::cli::{parse_args, AgentAction, Command, ScanPolicy};
 use diskledger::kstat::{parse_apfs_util_s, DirStat};
 use diskledger::store::{Config, Row, Snapshot, Store};
 use diskledger::util::{
@@ -64,6 +64,25 @@ fn push_opt(args: &mut Vec<String>, name: &str, val: &str, eq_style: bool) {
     }
 }
 
+fn policy_strategy() -> impl Strategy<Value = (ScanPolicy, Option<(String, bool)>)> {
+    prop_oneof![
+        Just((ScanPolicy::Fresh, None)),
+        Just((ScanPolicy::NoScan, None)),
+        (1u64..120, any::<bool>()).prop_map(|(m, eq)| (ScanPolicy::MaxAge(m * 60), Some((format!("{m}m"), eq)))),
+    ]
+}
+
+fn push_policy(argv: &mut Vec<String>, policy: ScanPolicy, max_age_fmt: Option<(String, bool)>) {
+    match policy {
+        ScanPolicy::Fresh => {}
+        ScanPolicy::NoScan => argv.push("--no-scan".into()),
+        ScanPolicy::MaxAge(_) => {
+            let (s, eq) = max_age_fmt.unwrap();
+            push_opt(argv, "--max-age", &s, eq);
+        }
+    }
+}
+
 fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
     prop_oneof![
         // init
@@ -98,11 +117,11 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
         (
             proptest::option::of(safe_ident()),
             proptest::option::of(size_arg_strategy()),
-            any::<bool>(),
+            policy_strategy(),
             any::<bool>(),
             any::<bool>(),
         )
-            .prop_map(|(since, min_opt, no_scan, json, eq_style)| {
+            .prop_map(|(since, min_opt, (policy, ma_fmt), json, eq_style)| {
                 let mut argv = vec!["diff".to_string()];
                 if let Some(ref s) = since {
                     push_opt(&mut argv, "--since", s, eq_style);
@@ -113,30 +132,24 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                 } else {
                     100 << 20
                 };
-                if no_scan {
-                    argv.push("--no-scan".into());
-                }
+                push_policy(&mut argv, policy, ma_fmt);
                 if json {
                     argv.push("--json".into());
                 }
-                (Command::Diff { since, min, no_scan, json }, argv)
+                (Command::Diff { since, min, policy, json }, argv)
             }),
         // checkin
-        any::<bool>().prop_map(|no_scan| {
+        policy_strategy().prop_map(|(policy, ma_fmt)| {
             let mut argv = vec!["checkin".to_string()];
-            if no_scan {
-                argv.push("--no-scan".into());
-            }
-            (Command::Checkin { no_scan }, argv)
+            push_policy(&mut argv, policy, ma_fmt);
+            (Command::Checkin { policy }, argv)
         }),
         // checkpoint
-        (safe_ident(), any::<bool>()).prop_map(|(name, no_scan)| {
+        (safe_ident(), policy_strategy()).prop_map(|(name, (policy, ma_fmt))| {
             let mut argv = vec!["checkpoint".to_string()];
-            if no_scan {
-                argv.push("--no-scan".into());
-            }
+            push_policy(&mut argv, policy, ma_fmt);
             argv.push(name.clone());
-            (Command::Checkpoint { name, no_scan }, argv)
+            (Command::Checkpoint { name, policy }, argv)
         }),
         // size
         (prop::collection::vec(safe_path(), 1..=4), any::<bool>(), any::<bool>(), any::<bool>())
@@ -159,11 +172,11 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
             proptest::option::of(safe_path()),
             proptest::option::of(size_arg_strategy()),
             proptest::option::of(0usize..12),
-            any::<bool>(),
+            policy_strategy(),
             any::<bool>(),
             any::<bool>(),
         )
-            .prop_map(|(under, min_opt, depth_opt, no_scan, json, eq_style)| {
+            .prop_map(|(under, min_opt, depth_opt, (policy, ma_fmt), json, eq_style)| {
                 let mut argv = vec!["top".to_string()];
                 let min = if let Some((s, bytes)) = min_opt {
                     push_opt(&mut argv, "--min", &s, eq_style);
@@ -177,9 +190,7 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                 } else {
                     4
                 };
-                if no_scan {
-                    argv.push("--no-scan".into());
-                }
+                push_policy(&mut argv, policy, ma_fmt);
                 if json {
                     argv.push("--json".into());
                 }
@@ -189,11 +200,11 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                     }
                     argv.push(u.clone());
                 }
-                (Command::Top { under, min, depth, no_scan, json }, argv)
+                (Command::Top { under, min, depth, policy, json }, argv)
             }),
         // candidates
-        (proptest::option::of(size_arg_strategy()), any::<bool>(), any::<bool>(), any::<bool>())
-            .prop_map(|(min_opt, no_scan, json, eq_style)| {
+        (proptest::option::of(size_arg_strategy()), policy_strategy(), any::<bool>(), any::<bool>())
+            .prop_map(|(min_opt, (policy, ma_fmt), json, eq_style)| {
                 let mut argv = vec!["candidates".to_string()];
                 let min = if let Some((s, bytes)) = min_opt {
                     push_opt(&mut argv, "--min", &s, eq_style);
@@ -201,13 +212,11 @@ fn command_and_argv() -> impl Strategy<Value = (Command, Vec<String>)> {
                 } else {
                     500 << 20
                 };
-                if no_scan {
-                    argv.push("--no-scan".into());
-                }
+                push_policy(&mut argv, policy, ma_fmt);
                 if json {
                     argv.push("--json".into());
                 }
-                (Command::Candidates { min, no_scan, json }, argv)
+                (Command::Candidates { min, policy, json }, argv)
             }),
         // status
         any::<bool>().prop_map(|json| {
@@ -287,6 +296,15 @@ proptest! {
             "typo flag must be rejected, got Ok for {:?}",
             argv
         );
+    }
+
+    #[test]
+    fn cli_no_scan_and_max_age_conflict(
+        sub in prop_oneof![Just("diff"), Just("top"), Just("candidates"), Just("checkin")],
+        mins in 1u64..60,
+    ) {
+        let argv = vec![sub.to_string(), "--no-scan".into(), "--max-age".into(), format!("{mins}m")];
+        prop_assert!(parse_args(&argv).is_err());
     }
 
     #[test]

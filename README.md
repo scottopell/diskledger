@@ -55,7 +55,8 @@ subtree, which is still several times faster than `du`.
 account for and how much happened elsewhere on the volume (`outside_delta`
 in JSON). A large "elsewhere" figure means something outside the monitored
 folders grew or shrank.
-Add `--no-scan` to report from the latest stored snapshot without touching the disk.
+Add `--no-scan` to report from the latest stored snapshot without touching the
+disk, or `--max-age 5m` to reuse a recent background scan when fresh enough.
 
 ## How flagging works
 
