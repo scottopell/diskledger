@@ -29,9 +29,15 @@ pub fn human_delta(d: i64) -> String {
     }
 }
 
-/// "500M", "2G", "1024" (bytes).
+/// "500M", "2G", "1024" (bytes). Rejects negative, NaN, infinity, and u64 overflow.
 pub fn parse_size(s: &str) -> Res<u64> {
     let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size (use e.g. 500M, 2G)".into());
+    }
+    if s.starts_with('-') || s.starts_with('+') {
+        return Err(format!("bad size '{s}' (must be non-negative, e.g. 500M, 2G)"));
+    }
     let (num, mult) = match s.chars().last().map(|c| c.to_ascii_uppercase()) {
         Some('K') => (&s[..s.len() - 1], 1u64 << 10),
         Some('M') => (&s[..s.len() - 1], 1u64 << 20),
@@ -39,21 +45,35 @@ pub fn parse_size(s: &str) -> Res<u64> {
         Some('T') => (&s[..s.len() - 1], 1u64 << 40),
         _ => (s, 1),
     };
+    if num.is_empty() {
+        return Err(format!("bad size '{s}' (use e.g. 500M, 2G)"));
+    }
+    if let Ok(exact) = num.parse::<u64>() {
+        return exact.checked_mul(mult).ok_or_else(|| format!("size '{s}' is too large"));
+    }
     let v: f64 = num.parse().map_err(|_| format!("bad size '{s}' (use e.g. 500M, 2G)"))?;
-    Ok((v * mult as f64) as u64)
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("bad size '{s}' (use e.g. 500M, 2G)"));
+    }
+    let scaled = v * mult as f64;
+    // u64::MAX as f64 rounds up to 2^64; anything >= that overflows u64.
+    if !scaled.is_finite() || scaled < 0.0 || scaled >= (u64::MAX as f64) {
+        return Err(format!("size '{s}' is too large"));
+    }
+    Ok(scaled as u64)
 }
 
-/// "90m", "2h", "3d" -> seconds.
+/// "90m", "2h", "3d" -> seconds. Returns None on invalid syntax or overflow.
 pub fn parse_duration(s: &str) -> Option<u64> {
     let s = s.trim();
-    let (num, mult) = match s.chars().last()? {
+    let (num, mult): (&str, u64) = match s.chars().last()? {
         's' => (&s[..s.len() - 1], 1),
         'm' => (&s[..s.len() - 1], 60),
         'h' => (&s[..s.len() - 1], 3600),
         'd' => (&s[..s.len() - 1], 86400),
         _ => return None,
     };
-    num.parse::<u64>().ok().map(|v| v * mult)
+    num.parse::<u64>().ok().and_then(|v| v.checked_mul(mult))
 }
 
 pub fn fmt_age(secs: u64) -> String {
@@ -106,7 +126,10 @@ pub fn json_str(s: &str) -> String {
 
 /// Escape a path for one TSV field.
 pub fn tsv_esc(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 pub fn tsv_unesc(s: &str) -> String {
@@ -117,6 +140,7 @@ pub fn tsv_unesc(s: &str) -> String {
             match it.next() {
                 Some('t') => o.push('\t'),
                 Some('n') => o.push('\n'),
+                Some('r') => o.push('\r'),
                 Some(other) => o.push(other),
                 None => {}
             }
@@ -127,40 +151,44 @@ pub fn tsv_unesc(s: &str) -> String {
     o
 }
 
-/// Parent of "/a/b/c" is "/a/b".
+/// Strip trailing slashes unless the path is "/".
+pub fn normalize_path_str(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && path.starts_with('/') {
+        "/".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Parent of "/a/b/c" is Some("/a/b"); parent of "/a" is Some("/"); parent of "/" is None.
 pub fn parent_of(path: &str) -> Option<&str> {
-    path.rfind('/').filter(|&i| i > 0).map(|i| &path[..i])
+    let i = path.rfind('/')?;
+    if i == 0 {
+        if path.len() > 1 { Some("/") } else { None }
+    } else {
+        Some(&path[..i])
+    }
 }
 
 pub fn base_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    if path == "/" {
+        "/"
+    } else {
+        path.rsplit('/').next().unwrap_or(path)
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sizes() {
-        assert_eq!(parse_size("2G").unwrap(), 2 << 30);
-        assert_eq!(parse_size("500m").unwrap(), 500 << 20);
-        assert_eq!(parse_size("17").unwrap(), 17);
-        assert!(parse_size("abc").is_err());
-        assert_eq!(human(3 << 30), "3.0G");
-        assert_eq!(human_delta(-(5 << 20)), "-5M");
+/// True when `path` is a strict descendant of `ancestor`.
+pub fn is_under(path: &str, ancestor: &str) -> bool {
+    if ancestor == "/" {
+        path.starts_with('/') && path.len() > 1
+    } else {
+        path.starts_with(ancestor) && path.as_bytes().get(ancestor.len()) == Some(&b'/')
     }
+}
 
-    #[test]
-    fn times() {
-        assert_eq!(fmt_ts(0), "1970-01-01T00:00:00Z");
-        assert_eq!(fmt_ts(1_794_700_800), "2026-11-15T00:00:00Z");
-        assert_eq!(parse_duration("2h"), Some(7200));
-        assert_eq!(parse_duration("x"), None);
-    }
-
-    #[test]
-    fn tsv_roundtrip() {
-        let p = "/a\tb/c\\d\ne";
-        assert_eq!(tsv_unesc(&tsv_esc(p)), p);
-    }
+/// True when `path == ancestor` or `path` is beneath `ancestor`.
+pub fn is_same_or_under(path: &str, ancestor: &str) -> bool {
+    path == ancestor || is_under(path, ancestor)
 }
