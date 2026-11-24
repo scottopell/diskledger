@@ -1,7 +1,7 @@
 //! External OS/APFS/clock boundary so scanning and state transitions can run
 //! deterministically against an in-memory simulator as well as real macOS APFS.
 
-use crate::kstat::{self, DirStat};
+use crate::kstat::{self, DirStat, VolumeInfo};
 use crate::util;
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
@@ -27,6 +27,10 @@ pub trait System: Send + Sync {
     fn query(&self, path: &Path) -> io::Result<DirStat>;
     fn flag(&self, path: &Path) -> io::Result<()>;
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)>;
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        let (free, total) = self.volume_space(path)?;
+        Ok(VolumeInfo { free, total, ..Default::default() })
+    }
     /// If `path` is a directory (following symlinks at the root), return `Ok(Some(dev))`.
     /// If it exists and is not a directory, return `Ok(None)`.
     fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>>;
@@ -53,6 +57,10 @@ impl System for RealSystem {
 
     fn volume_space(&self, path: &Path) -> io::Result<(u64, u64)> {
         kstat::volume_space(path)
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        kstat::volume_info(path)
     }
 
     fn dir_dev(&self, path: &Path) -> io::Result<Option<u64>> {

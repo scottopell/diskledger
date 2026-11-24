@@ -13,10 +13,10 @@
 //! `diskledger doctor` (or `run_doctor`) to verify `fsctl` matches `apfs.util -S`.
 
 use crate::util::json_str;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Write};
-use std::os::raw::{c_char, c_int, c_uint, c_ulong, c_void};
+use std::os::raw::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -24,6 +24,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 extern "C" {
     fn fsctl(path: *const c_char, request: c_ulong, data: *mut c_void, options: c_uint) -> c_int;
+    fn getattrlist(
+        path: *const c_char,
+        attrlist: *mut c_void,
+        attrbuf: *mut c_void,
+        attrbufsize: libc::size_t,
+        options: c_uint,
+    ) -> c_int;
+    fn fs_snapshot_list(
+        dirfd: c_int,
+        attrlist: *mut c_void,
+        attrbuf: *mut c_void,
+        bufsize: libc::size_t,
+        flags: u32,
+    ) -> c_int;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    static kCFURLVolumeAvailableCapacityKey: *const c_void;
+    static kCFURLVolumeAvailableCapacityForImportantUsageKey: *const c_void;
+    fn CFURLCreateFromFileSystemRepresentation(
+        allocator: *const c_void,
+        buffer: *const u8,
+        buf_len: c_long,
+        is_directory: u8,
+    ) -> *const c_void;
+    fn CFURLCopyResourcePropertyForKey(
+        url: *const c_void,
+        key: *const c_void,
+        property_value_type_ref_ptr: *mut *const c_void,
+        error: *mut *const c_void,
+    ) -> u8;
+    fn CFNumberGetValue(number: *const c_void, the_type: c_long, value_ptr: *mut c_void) -> u8;
+    fn CFRelease(cf: *const c_void);
 }
 
 /// _IOWR('J', 0x71, 272-byte struct)
@@ -144,6 +178,206 @@ pub fn query_via_apfs_util(path: &Path) -> io::Result<DirStat> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     parse_apfs_util_s(&text)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// Free bytes immediately available to this user (`statfs.f_bavail * f_bsize`).
+    pub free: u64,
+    /// Total APFS container/volume capacity (`statfs.f_blocks * f_bsize`).
+    pub total: u64,
+    /// Purgeable bytes macOS can reclaim on demand (`max(important_avail - avail, 0)`).
+    pub purgeable: Option<u64>,
+    /// Bytes used by this APFS volume alone (`getattrlist ATTR_VOL_SPACEUSED`).
+    /// `(total - free) - volume_used` is space used by sibling volumes in the same
+    /// APFS container (e.g. VM swapfile, System, Preboot, Recovery).
+    pub volume_used: Option<u64>,
+    /// Local APFS snapshot names on this volume (`fs_snapshot_list`).
+    pub snapshots: Vec<String>,
+}
+
+impl VolumeInfo {
+    /// Bytes used by sibling volumes in the same APFS container (e.g. VM swap, System).
+    pub fn other_volumes_used(&self) -> Option<u64> {
+        let vu = self.volume_used?;
+        Some(self.total.saturating_sub(self.free).saturating_sub(vu))
+    }
+}
+
+#[repr(C)]
+struct AttrList {
+    bitmapcount: u16,
+    reserved: u16,
+    commonattr: u32,
+    volattr: u32,
+    dirattr: u32,
+    fileattr: u32,
+    forkattr: u32,
+}
+
+const ATTR_BIT_MAP_COUNT: u16 = 5;
+const ATTR_CMN_NAME: u32 = 0x0000_0001;
+const ATTR_CMN_RETURNED_ATTRS: u32 = 0x8000_0000;
+const ATTR_VOL_INFO: u32 = 0x8000_0000;
+const ATTR_VOL_SPACEUSED: u32 = 0x0080_0000;
+
+fn query_volume_used(mount_c: &CStr) -> Option<u64> {
+    #[repr(C, packed(4))]
+    struct VolUsedBuf {
+        length: u32,
+        space_used: u64,
+    }
+    let mut alist = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: 0,
+        volattr: ATTR_VOL_INFO | ATTR_VOL_SPACEUSED,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = VolUsedBuf { length: 0, space_used: 0 };
+    let rc = unsafe {
+        getattrlist(
+            mount_c.as_ptr(),
+            &mut alist as *mut AttrList as *mut c_void,
+            &mut buf as *mut VolUsedBuf as *mut c_void,
+            std::mem::size_of::<VolUsedBuf>(),
+            0,
+        )
+    };
+    if rc == 0 && buf.length as usize >= std::mem::size_of::<VolUsedBuf>() {
+        Some(buf.space_used)
+    } else {
+        None
+    }
+}
+
+fn query_purgeable_bytes(path: &Path) -> Option<u64> {
+    const K_CF_NUMBER_SINT64_TYPE: c_long = 4;
+    let bytes = path.as_os_str().as_bytes();
+    unsafe {
+        let url = CFURLCreateFromFileSystemRepresentation(
+            std::ptr::null(),
+            bytes.as_ptr(),
+            bytes.len() as c_long,
+            1,
+        );
+        if url.is_null() {
+            return None;
+        }
+        let get_i64 = |key: *const c_void| -> Option<i64> {
+            let mut val: *const c_void = std::ptr::null();
+            let mut err: *const c_void = std::ptr::null();
+            let ok = CFURLCopyResourcePropertyForKey(url, key, &mut val, &mut err);
+            if !err.is_null() {
+                CFRelease(err);
+            }
+            if ok == 0 || val.is_null() {
+                if !val.is_null() {
+                    CFRelease(val);
+                }
+                return None;
+            }
+            let mut out: i64 = 0;
+            let got = CFNumberGetValue(val, K_CF_NUMBER_SINT64_TYPE, &mut out as *mut i64 as *mut c_void);
+            CFRelease(val);
+            if got != 0 { Some(out) } else { None }
+        };
+        let avail = get_i64(kCFURLVolumeAvailableCapacityKey);
+        let important = get_i64(kCFURLVolumeAvailableCapacityForImportantUsageKey);
+        CFRelease(url);
+        match (avail, important) {
+            (Some(a), Some(i)) if i >= a => Some((i - a) as u64),
+            (Some(_), Some(_)) => Some(0),
+            _ => None,
+        }
+    }
+}
+
+fn query_apfs_snapshots(mount_c: &CStr) -> Vec<String> {
+    let fd = unsafe { libc::open(mount_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if fd < 0 {
+        return Vec::new();
+    }
+    struct FdGuard(c_int);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _guard = FdGuard(fd);
+
+    let mut alist = AttrList {
+        bitmapcount: ATTR_BIT_MAP_COUNT,
+        reserved: 0,
+        commonattr: ATTR_CMN_RETURNED_ATTRS | ATTR_CMN_NAME,
+        volattr: 0,
+        dirattr: 0,
+        fileattr: 0,
+        forkattr: 0,
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut names = Vec::new();
+    loop {
+        let n = unsafe {
+            fs_snapshot_list(
+                fd,
+                &mut alist as *mut AttrList as *mut c_void,
+                buf.as_mut_ptr() as *mut c_void,
+                buf.len(),
+                0,
+            )
+        };
+        if n <= 0 {
+            break;
+        }
+        let mut off = 0usize;
+        for _ in 0..n {
+            if off + 32 > buf.len() {
+                break;
+            }
+            let rec_len = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            if rec_len < 32 || off + rec_len > buf.len() {
+                break;
+            }
+            // Layout: u32 length (0..4), attribute_set_t (4..24), attrreference_t { i32 offset, u32 len } (24..32)
+            let data_off = i32::from_ne_bytes(buf[off + 24..off + 28].try_into().unwrap());
+            let data_len = u32::from_ne_bytes(buf[off + 28..off + 32].try_into().unwrap()) as usize;
+            if data_off >= 0 {
+                let start = off + 24 + data_off as usize;
+                let end = start.saturating_add(data_len).min(off + rec_len);
+                if start <= end {
+                    let slice = &buf[start..end];
+                    let trimmed = slice.split(|&b| b == 0).next().unwrap_or(slice);
+                    if !trimmed.is_empty() {
+                        names.push(String::from_utf8_lossy(trimmed).into_owned());
+                    }
+                }
+            }
+            off += rec_len;
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Full APFS volume space breakdown (free, total, purgeable, per-volume used, local snapshots).
+pub fn volume_info(path: &Path) -> io::Result<VolumeInfo> {
+    let c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let bs = s.f_bsize as u64;
+    let free = (s.f_bavail as u64).saturating_mul(bs);
+    let total = (s.f_blocks as u64).saturating_mul(bs);
+    let mount_c = unsafe { CStr::from_ptr(s.f_mntonname.as_ptr()) };
+    let volume_used = query_volume_used(mount_c);
+    let purgeable = query_purgeable_bytes(path);
+    let snapshots = query_apfs_snapshots(mount_c);
+    Ok(VolumeInfo { free, total, purgeable, volume_used, snapshots })
 }
 
 /// (free bytes available to this user, total bytes) for the volume holding `path`.
@@ -359,17 +593,38 @@ pub fn run_doctor(roots: &[PathBuf]) -> DoctorReport {
         }
     }
 
-    // 4. Volume space sanity
-    match volume_space(&probe_path) {
-        Ok((free, total)) if total > 0 && free <= total => checks.push(DoctorCheck {
-            name: "volume_space".into(),
-            status: CheckStatus::Pass,
-            detail: format!("free={free} <= total={total}"),
-        }),
-        Ok((free, total)) => checks.push(DoctorCheck {
+    // 4. Volume space & APFS breakdown sanity
+    match volume_info(&probe_path) {
+        Ok(vi) if vi.total > 0 && vi.free <= vi.total => {
+            let purge_ok = vi.purgeable.map_or(true, |p| vi.free.saturating_add(p) <= vi.total);
+            let vol_ok = vi
+                .volume_used
+                .map_or(true, |vu| vu <= vi.total.saturating_sub(vi.free) + (1 << 30));
+            if purge_ok && vol_ok {
+                checks.push(DoctorCheck {
+                    name: "volume_space".into(),
+                    status: CheckStatus::Pass,
+                    detail: format!(
+                        "free={} <= total={}, purgeable={:?}, vol_used={:?}, apfs_snapshots={}",
+                        vi.free,
+                        vi.total,
+                        vi.purgeable,
+                        vi.volume_used,
+                        vi.snapshots.len()
+                    ),
+                });
+            } else {
+                checks.push(DoctorCheck {
+                    name: "volume_space".into(),
+                    status: CheckStatus::Fail,
+                    detail: format!("inconsistent volume info: {vi:?}"),
+                });
+            }
+        }
+        Ok(vi) => checks.push(DoctorCheck {
             name: "volume_space".into(),
             status: CheckStatus::Fail,
-            detail: format!("invalid volume space: free={free}, total={total}"),
+            detail: format!("invalid volume space: free={}, total={}", vi.free, vi.total),
         }),
         Err(e) => checks.push(DoctorCheck {
             name: "volume_space".into(),

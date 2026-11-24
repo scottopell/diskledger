@@ -3,7 +3,7 @@
 //! in-memory APFS filesystem simulator (`FakeFs`) and virtual clock.
 
 use diskledger::cli::{current_with, fresh_scan_with, resolve_since_at, ScanPolicy};
-use diskledger::kstat::DirStat;
+use diskledger::kstat::{DirStat, VolumeInfo};
 use diskledger::report::{compute_candidates, compute_diff, compute_top, DiffStatus};
 use diskledger::scan::{self, ScanOpts};
 use diskledger::store::{Config, Snapshot, Store};
@@ -77,6 +77,9 @@ struct FakeState {
 struct FakeFs {
     state: Mutex<FakeState>,
     outside_used: AtomicU64,
+    other_volumes_used: AtomicU64,
+    purgeable: AtomicU64,
+    apfs_snapshots: AtomicU64,
     volume_total: u64,
     clock: AtomicU64,
     ops: Mutex<OpCounts>,
@@ -93,6 +96,9 @@ impl FakeFs {
                 symlinks: BTreeMap::new(),
             }),
             outside_used: AtomicU64::new(10 << 30),
+            other_volumes_used: AtomicU64::new(5 << 30),
+            purgeable: AtomicU64::new(1 << 30),
+            apfs_snapshots: AtomicU64::new(0),
             volume_total: 200 << 30,
             clock: AtomicU64::new(start_ts),
             ops: Mutex::new(OpCounts::default()),
@@ -202,6 +208,32 @@ impl FakeFs {
         self.outside_used.store(next, Ordering::Relaxed);
     }
 
+    fn adjust_apfs_container(&self, other_vol_delta: i64, purgeable_delta: i64, snap_delta: i8) {
+        let ov = self.other_volumes_used.load(Ordering::Relaxed);
+        let next_ov = if other_vol_delta >= 0 {
+            ov.saturating_add(other_vol_delta as u64).min(40 << 30)
+        } else {
+            ov.saturating_sub(other_vol_delta.unsigned_abs())
+        };
+        self.other_volumes_used.store(next_ov, Ordering::Relaxed);
+
+        let pu = self.purgeable.load(Ordering::Relaxed);
+        let next_pu = if purgeable_delta >= 0 {
+            pu.saturating_add(purgeable_delta as u64).min(20 << 30)
+        } else {
+            pu.saturating_sub(purgeable_delta.unsigned_abs())
+        };
+        self.purgeable.store(next_pu, Ordering::Relaxed);
+
+        let sn = self.apfs_snapshots.load(Ordering::Relaxed);
+        let next_sn = if snap_delta >= 0 {
+            sn.saturating_add(snap_delta as u64).min(10)
+        } else {
+            sn.saturating_sub(snap_delta.unsigned_abs() as u64)
+        };
+        self.apfs_snapshots.store(next_sn, Ordering::Relaxed);
+    }
+
     /// Ground-truth same-volume stats for `path`, matching APFS semantics.
     fn ground_truth_stats(&self, path: &str) -> Option<DirStat> {
         let p = normalize_path_str(path);
@@ -281,6 +313,11 @@ impl FakeFs {
             .sum();
         file_sum.saturating_add(self.outside_used.load(Ordering::Relaxed))
     }
+
+    fn vol1_container_used(&self) -> u64 {
+        self.vol1_used()
+            .saturating_add(self.other_volumes_used.load(Ordering::Relaxed))
+    }
 }
 
 impl System for FakeFs {
@@ -325,10 +362,45 @@ impl System for FakeFs {
             .map(|d| d.dev)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))?;
         if dev == 1 {
-            let used = self.vol1_used();
+            let used = self.vol1_container_used();
             Ok((self.volume_total.saturating_sub(used), self.volume_total))
         } else {
             Ok((50 << 30, 100 << 30))
+        }
+    }
+
+    fn volume_info(&self, path: &Path) -> io::Result<VolumeInfo> {
+        let p = normalize_path_str(&path.to_string_lossy());
+        self.ops.lock().unwrap().volume_space += 1;
+        let dev = self
+            .state
+            .lock()
+            .unwrap()
+            .dirs
+            .get(&p)
+            .map(|d| d.dev)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such path"))?;
+        if dev == 1 {
+            let vol_used = self.vol1_used();
+            let container_used = vol_used.saturating_add(self.other_volumes_used.load(Ordering::Relaxed));
+            let free = self.volume_total.saturating_sub(container_used);
+            let sn = self.apfs_snapshots.load(Ordering::Relaxed);
+            let snapshots = (0..sn).map(|i| format!("com.apple.TimeMachine.snap-{i}")).collect();
+            Ok(VolumeInfo {
+                free,
+                total: self.volume_total,
+                purgeable: Some(self.purgeable.load(Ordering::Relaxed)),
+                volume_used: Some(vol_used),
+                snapshots,
+            })
+        } else {
+            Ok(VolumeInfo {
+                free: 50 << 30,
+                total: 100 << 30,
+                purgeable: Some(0),
+                volume_used: Some(50 << 30),
+                snapshots: Vec::new(),
+            })
         }
     }
 
@@ -455,6 +527,7 @@ enum Transition {
     AddSymlinkCycle { parent_idx: usize, target_idx: usize },
     AddCrossDevMount { parent_idx: usize, bytes: u64 },
     OutsideVolumeDelta { delta: i64 },
+    ApfsContainerShift { other_vol_delta: i64, purgeable_delta: i64, snap_delta: i8 },
     AdvanceTime { dt: u64 },
     AddRoot { same_volume: bool },
     RemoveRoot { root_idx: usize },
@@ -496,6 +569,10 @@ fn transition_strategy() -> impl Strategy<Value = Transition> {
             .prop_map(|(parent_idx, bytes)| Transition::AddCrossDevMount { parent_idx, bytes }),
         2 => (-(4i64 << 20)..=(4i64 << 20))
             .prop_map(|delta| Transition::OutsideVolumeDelta { delta }),
+        1 => (-(200i64 << 20)..=(200i64 << 20), -(200i64 << 20)..=(200i64 << 20), -1i8..=2i8)
+            .prop_map(|(other_vol_delta, purgeable_delta, snap_delta)| {
+                Transition::ApfsContainerShift { other_vol_delta, purgeable_delta, snap_delta }
+            }),
         2 => prop_oneof![
             Just(0u64),
             1u64..3600,
@@ -739,6 +816,9 @@ proptest! {
                 Transition::OutsideVolumeDelta { delta } => {
                     fs.adjust_outside(delta);
                 }
+                Transition::ApfsContainerShift { other_vol_delta, purgeable_delta, snap_delta } => {
+                    fs.adjust_apfs_container(other_vol_delta, purgeable_delta, snap_delta);
+                }
                 Transition::AdvanceTime { dt } => {
                     fs.advance_time(dt);
                 }
@@ -928,7 +1008,7 @@ proptest! {
                         let base = store.load(base_ts).expect("load base snapshot");
                         let diff = compute_diff(&base, &cur, min);
 
-                        // Accounting conservation.
+                        // Accounting conservation (both 2-way and 3-way APFS container breakdown).
                         if base.single_volume && cur.single_volume {
                             let out = diff.outside_delta.expect("single_volume diff must have outside_delta");
                             prop_assert_eq!(
@@ -936,12 +1016,24 @@ proptest! {
                                 -diff.free_delta,
                                 "accounting conservation violated"
                             );
+                            if let (Some(unmon), Some(other)) =
+                                (diff.unmonitored_volume_delta, diff.other_volumes_delta)
+                            {
+                                prop_assert_eq!(
+                                    diff.monitored_delta + unmon + other,
+                                    -diff.free_delta,
+                                    "3-way APFS container conservation violated"
+                                );
+                                prop_assert_eq!(unmon + other, out);
+                            }
                         } else {
                             prop_assert_eq!(
                                 diff.outside_delta,
                                 None,
                                 "multi-volume diff must omit outside_delta"
                             );
+                            prop_assert_eq!(diff.unmonitored_volume_delta, None);
+                            prop_assert_eq!(diff.other_volumes_delta, None);
                         }
 
                         // Exact ground-truth monitored_delta over roots present in BOTH configs.

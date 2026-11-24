@@ -353,19 +353,15 @@ pub fn run_with_threads(
 
     let mut root_devs = HashSet::new();
     let mut valid_roots: Vec<(&Path, u64)> = Vec::new();
-    let mut free = 0u64;
-    let mut total = 0u64;
-    let mut got_vol = false;
+    let mut vol_info: Option<kstat::VolumeInfo> = None;
 
     for root in &cfg.roots {
         match sys.dir_dev(root) {
             Ok(Some(dev)) => {
                 root_devs.insert(dev);
-                if !got_vol {
-                    if let Ok((f, t)) = sys.volume_space(root) {
-                        free = f;
-                        total = t;
-                        got_vol = true;
+                if vol_info.is_none() {
+                    if let Ok(vi) = sys.volume_info(root) {
+                        vol_info = Some(vi);
                     }
                 }
                 valid_roots.push((root.as_path(), dev));
@@ -374,14 +370,14 @@ pub fn run_with_threads(
             Err(e) => cx.out.lock().unwrap().errors.push(format!("{}: {e}", root.display())),
         }
     }
-    if !got_vol {
+    if vol_info.is_none() {
         if let Some(root) = cfg.roots.first() {
-            if let Ok((f, t)) = sys.volume_space(root) {
-                free = f;
-                total = t;
+            if let Ok(vi) = sys.volume_info(root) {
+                vol_info = Some(vi);
             }
         }
     }
+    let vi = vol_info.unwrap_or_default();
 
     let threads = threads.max(1);
     if threads == 1 {
@@ -416,8 +412,11 @@ pub fn run_with_threads(
     ScanReport {
         snapshot: Snapshot {
             ts,
-            free,
-            total,
+            free: vi.free,
+            total: vi.total,
+            purgeable: vi.purgeable,
+            volume_used: vi.volume_used,
+            apfs_snapshots: Some(vi.snapshots.len() as u64),
             roots: snap_roots,
             single_volume: root_devs.len() <= 1,
             extra_git_repos: out.extra_git_repos,

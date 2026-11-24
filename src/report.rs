@@ -67,6 +67,15 @@ pub struct DiffReport {
     pub monitored_delta: i64,
     /// None when roots span multiple volumes so a single free-space delta does not apply.
     pub outside_delta: Option<i64>,
+    /// Change in sibling APFS container volumes (e.g. VM swapfile, System, Preboot).
+    pub other_volumes_delta: Option<i64>,
+    /// Change in unmonitored space strictly on this volume (`outside_delta - other_volumes_delta`).
+    pub unmonitored_volume_delta: Option<i64>,
+    pub purgeable_before: Option<u64>,
+    pub purgeable_after: Option<u64>,
+    pub purgeable_delta: Option<i64>,
+    pub apfs_snapshots_before: Option<u64>,
+    pub apfs_snapshots_after: Option<u64>,
     pub min_bytes: u64,
     pub not_in_baseline: Vec<(String, u64)>,
     pub no_longer_monitored: Vec<(String, u64)>,
@@ -130,11 +139,32 @@ pub fn compute_diff(base: &Snapshot, cur: &Snapshot, min: u64) -> DiffReport {
         .map(|r| bytes_of(cur, r) as i64 - bytes_of(base, r) as i64)
         .sum();
     let free_delta = cur.free as i64 - base.free as i64;
-    let outside_delta = if base.single_volume && cur.single_volume {
+    let single_vol = base.single_volume && cur.single_volume;
+    let outside_delta = if single_vol {
         Some(-free_delta - monitored_delta)
     } else {
         None
     };
+    let other_volumes_delta = if single_vol {
+        match (base.other_volumes_used(), cur.other_volumes_used()) {
+            (Some(b), Some(c)) => Some(c as i64 - b as i64),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let unmonitored_volume_delta = match (outside_delta, other_volumes_delta) {
+        (Some(out), Some(other)) => Some(out - other),
+        _ => None,
+    };
+    let purgeable_before = if single_vol { base.purgeable } else { None };
+    let purgeable_after = if single_vol { cur.purgeable } else { None };
+    let purgeable_delta = match (purgeable_before, purgeable_after) {
+        (Some(b), Some(c)) => Some(c as i64 - b as i64),
+        _ => None,
+    };
+    let apfs_snapshots_before = if single_vol { base.apfs_snapshots } else { None };
+    let apfs_snapshots_after = if single_vol { cur.apfs_snapshots } else { None };
 
     let mut changes: Vec<DiffRow> = rows
         .values()
@@ -156,6 +186,13 @@ pub fn compute_diff(base: &Snapshot, cur: &Snapshot, min: u64) -> DiffReport {
         free_delta,
         monitored_delta,
         outside_delta,
+        other_volumes_delta,
+        unmonitored_volume_delta,
+        purgeable_before,
+        purgeable_after,
+        purgeable_delta,
+        apfs_snapshots_before,
+        apfs_snapshots_after,
         min_bytes: min,
         not_in_baseline,
         no_longer_monitored,
@@ -182,20 +219,25 @@ impl DiffReport {
                 )
             })
             .collect();
-        let outside = match self.outside_delta {
-            Some(v) => v.to_string(),
-            None => "null".to_string(),
-        };
+        let opt_i64 = |v: Option<i64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
+        let opt_u64 = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
         writeln!(
             w,
-            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"monitored_delta\":{},\"outside_delta\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"no_longer_monitored\":[{}],\"changes\":[{}]}}",
+            "{{\"since\":{},\"now\":{},\"free_before\":{},\"free_after\":{},\"free_delta\":{},\"monitored_delta\":{},\"outside_delta\":{},\"unmonitored_volume_delta\":{},\"other_volumes_delta\":{},\"purgeable_before\":{},\"purgeable_after\":{},\"purgeable_delta\":{},\"apfs_snapshots_before\":{},\"apfs_snapshots_after\":{},\"min_bytes\":{},\"not_in_baseline\":[{}],\"no_longer_monitored\":[{}],\"changes\":[{}]}}",
             self.since,
             self.now,
             self.free_before,
             self.free_after,
             self.free_delta,
             self.monitored_delta,
-            outside,
+            opt_i64(self.outside_delta),
+            opt_i64(self.unmonitored_volume_delta),
+            opt_i64(self.other_volumes_delta),
+            opt_u64(self.purgeable_before),
+            opt_u64(self.purgeable_after),
+            opt_i64(self.purgeable_delta),
+            opt_u64(self.apfs_snapshots_before),
+            opt_u64(self.apfs_snapshots_after),
             self.min_bytes,
             skipped.join(","),
             removed.join(","),
@@ -250,16 +292,54 @@ impl DiffReport {
         }
         match self.outside_delta {
             Some(out) => {
-                writeln!(
-                    w,
-                    "Monitored folders changed by {}; everything else on the volume by {}.",
-                    human_delta(self.monitored_delta),
-                    human_delta(out)
-                )?;
-                if out.unsigned_abs() >= self.min_bytes.max(256 << 20) {
+                match (self.unmonitored_volume_delta, self.other_volumes_delta) {
+                    (Some(unmon), Some(other)) if other.unsigned_abs() >= (64 << 20) => {
+                        writeln!(
+                            w,
+                            "Monitored folders changed by {}; unmonitored space on this volume by {}; other container volumes (VM/System) by {}.",
+                            human_delta(self.monitored_delta),
+                            human_delta(unmon),
+                            human_delta(other)
+                        )?;
+                    }
+                    _ => {
+                        writeln!(
+                            w,
+                            "Monitored folders changed by {}; everything else on the volume by {}.",
+                            human_delta(self.monitored_delta),
+                            human_delta(out)
+                        )?;
+                    }
+                }
+                if let (Some(pb), Some(pa), Some(pd)) =
+                    (self.purgeable_before, self.purgeable_after, self.purgeable_delta)
+                {
+                    if pd.unsigned_abs() >= (64 << 20) || (pa >= (512 << 20) && out > 0) {
+                        writeln!(
+                            w,
+                            "  APFS purgeable space: {} -> {} ({}).",
+                            human(pb),
+                            human(pa),
+                            human_delta(pd)
+                        )?;
+                    }
+                }
+                if let (Some(sb), Some(sa)) =
+                    (self.apfs_snapshots_before, self.apfs_snapshots_after)
+                {
+                    if sa > 0 || sb != sa {
+                        writeln!(
+                            w,
+                            "  Local APFS snapshots: {} -> {} (snapshots can pin freed blocks).",
+                            sb, sa
+                        )?;
+                    }
+                }
+                let actionable = self.unmonitored_volume_delta.unwrap_or(out);
+                if actionable.unsigned_abs() >= self.min_bytes.max(256 << 20) {
                     writeln!(
                         w,
-                        "  That is space used outside the monitored folders. Find it with 'diskledger size <path>' or add the folder as a root."
+                        "  Hunt unmonitored space with 'diskledger size -c ~' or track a folder with 'diskledger root add <path>'."
                     )?;
                 }
             }

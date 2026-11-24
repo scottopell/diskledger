@@ -700,11 +700,12 @@ fn cmd_candidates(sys: &dyn System, store: &Store, min: u64, policy: ScanPolicy,
 
 fn cmd_status(store: &Store, json: bool) -> Res<()> {
     let cfg = store.config()?;
-    let (free, total) = kstat::volume_space(&cfg.roots[0]).map_err(|e| e.to_string())?;
+    let vi = kstat::volume_info(&cfg.roots[0]).map_err(|e| e.to_string())?;
     let snaps = store.list();
     let latest = store.latest();
     let flagged = latest.as_ref().map_or(0, |s| s.rows.values().filter(|r| r.flagged).count());
     let cps = store.checkpoints();
+    let other_vols = vi.other_volumes_used();
     if json {
         let roots: Vec<String> = cfg
             .roots
@@ -721,10 +722,16 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
             })
             .collect();
         let cpj: Vec<String> = cps.iter().map(|(n, ts)| format!("{{\"name\":{},\"ts\":{}}}", json_str(n), ts)).collect();
+        let apfs_snaps: Vec<String> = vi.snapshots.iter().map(|s| json_str(s)).collect();
+        let opt_u64 = |v: Option<u64>| v.map_or_else(|| "null".to_string(), |x| x.to_string());
         println!(
-            "{{\"free\":{},\"total\":{},\"snapshots\":{},\"latest_ts\":{},\"flagged_dirs\":{},\"roots\":[{}],\"checkpoints\":[{}]}}",
-            free,
-            total,
+            "{{\"free\":{},\"total\":{},\"purgeable\":{},\"volume_used\":{},\"other_volumes_used\":{},\"apfs_snapshots\":[{}],\"snapshots\":{},\"latest_ts\":{},\"flagged_dirs\":{},\"roots\":[{}],\"checkpoints\":[{}]}}",
+            vi.free,
+            vi.total,
+            opt_u64(vi.purgeable),
+            opt_u64(vi.volume_used),
+            opt_u64(other_vols),
+            apfs_snaps.join(","),
             snaps.len(),
             latest.as_ref().map_or(0, |s| s.ts),
             flagged,
@@ -733,12 +740,36 @@ fn cmd_status(store: &Store, json: bool) -> Res<()> {
         );
         return Ok(());
     }
+    let mut extra = Vec::new();
+    if let Some(p) = vi.purgeable {
+        if p > 0 {
+            extra.push(format!("+{} purgeable", human(p)));
+        }
+    }
+    if let Some(ov) = other_vols {
+        if ov > 0 {
+            extra.push(format!("{} in other container volumes", human(ov)));
+        }
+    }
+    let extra_str = if extra.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", extra.join(", "))
+    };
     println!(
-        "Free space: {} of {} ({:.0}% used)",
-        human(free),
-        human(total),
-        100.0 * (1.0 - free as f64 / total.max(1) as f64)
+        "Free space: {} of {} ({:.0}% used{})",
+        human(vi.free),
+        human(vi.total),
+        100.0 * (1.0 - vi.free as f64 / vi.total.max(1) as f64),
+        extra_str
     );
+    if !vi.snapshots.is_empty() {
+        println!(
+            "Local APFS snapshots: {} ({})",
+            vi.snapshots.len(),
+            vi.snapshots.iter().take(3).cloned().collect::<Vec<_>>().join(", ")
+        );
+    }
     println!("State: {}", store.home.display());
     match &latest {
         Some(s) => println!(
