@@ -665,3 +665,23 @@ proptest! {
         prop_assert_eq!(store.load(snap.ts).unwrap(), snap);
     }
 }
+
+#[test]
+fn binary_handles_closed_stdout_pipe_without_panic() {
+    use std::process::{Command as ProcCommand, Stdio};
+    let bin = env!("CARGO_BIN_EXE_diskledger");
+    let mut child = ProcCommand::new(bin)
+        .arg("help")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn diskledger help");
+    // Drop stdout reader immediately to trigger EPIPE/SIGPIPE on write.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("wait diskledger help");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "diskledger panicked on broken pipe: {stderr}"
+    );
+}

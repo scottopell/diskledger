@@ -570,6 +570,11 @@ pub fn parse_args(raw: &[String]) -> Res<Command> {
 }
 
 pub fn main() {
+    // Restore default SIGPIPE handling so piping output (e.g. `diskledger status | head -n 1`)
+    // exits cleanly instead of panicking with "Broken pipe".
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let code = match run(&raw) {
         Ok(()) => 0,
